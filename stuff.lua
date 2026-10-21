@@ -41,8 +41,8 @@ local State = {
 	RerollDelay = 0.25,    -- seconds between reroll calls
 
 	-- boss settings
-	DodgeMargin = 5,         -- extra studs around each attack's area
-	BossHeight = 2,          -- studs above the top of the boss
+	DodgeMargin = 10,         -- extra studs around each attack's area
+	BossHeight = 7,          -- studs above the top of the boss
 	BossReturn = false,      -- teleport back to where you were after the fight
 	BossJoinExisting = true, -- jump into a fight that's already going
 
