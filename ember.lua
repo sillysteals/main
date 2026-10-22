@@ -2289,7 +2289,8 @@ function Library:BuildSettings(tab)
 		Callback = function()
 			local n = nameBox.Value ~= "" and nameBox.Value or saved.Value
 			if not n or n == "" then
-				return self:Notify({ Title = "Config", Content = "Type a config name first." })
+				self:Notify({ Title = "Config", Content = "Type a config name first." })
+				return
 			end
 			local ok, err = self:SaveConfig(n)
 			self:Notify({ Title = ok and "Config saved" or "Save failed", Content = ok and ("Saved '" .. n .. "'.") or tostring(err) })
@@ -2302,7 +2303,8 @@ function Library:BuildSettings(tab)
 		Callback = function()
 			local n = saved.Value or (nameBox.Value ~= "" and nameBox.Value) or nil
 			if not n then
-				return self:Notify({ Title = "Config", Content = "Pick a saved config first." })
+				self:Notify({ Title = "Config", Content = "Pick a saved config first." })
+				return
 			end
 			local ok, err = self:LoadConfig(n)
 			self:Notify({ Title = ok and "Config loaded" or "Load failed", Content = ok and ("Loaded '" .. n .. "'.") or tostring(err) })
@@ -2314,7 +2316,8 @@ function Library:BuildSettings(tab)
 		Callback = function()
 			local n = saved.Value
 			if not n then
-				return self:Notify({ Title = "Config", Content = "Pick a saved config first." })
+				self:Notify({ Title = "Config", Content = "Pick a saved config first." })
+				return
 			end
 			local ok, err = self:DeleteConfig(n)
 			self:Notify({ Title = ok and "Config deleted" or "Delete failed", Content = ok and ("Deleted '" .. n .. "'.") or tostring(err) })
