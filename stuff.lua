@@ -1277,8 +1277,8 @@ local function notify(title, content)
 end
 
 Window = Ember:CreateWindow({
-	Title = "Egg Farm",
-	Subtitle = "Autofarm",
+	Title = "EFSR",
+	Subtitle = "sigma",
 	ConfigFolder = "EggFarmSim",
 	ToggleKey = Enum.KeyCode.K,
 	OnClose = stop,
