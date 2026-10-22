@@ -34,6 +34,9 @@ local ItemsEvent = Events:WaitForChild("Items")
 local Heroes = {} -- [id] = { name = "Tarzan", upgrades = 5 }
 local heroDataError
 
+workspace.Farms:GetChildren()[3].Hatch.Egg.CanCollide = false
+workspace.Farms:GetChildren()[3].Hatch.Nest.CanCollide = false
+
 do
 	local ok, result = pcall(function()
 		return require(ReplicatedStorage:WaitForChild("Settings"):WaitForChild("HeroesData"))
