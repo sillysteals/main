@@ -1,5 +1,5 @@
 --[[
-	Egg Farm Simulator · Items tab (auto sell / auto open boxes) + Alt / Master trading
+	Egg Farm Simulator · Items tab (auto sell / auto open boxes), Abilities tab + Alt / Master trading
 	Loaded by the main autofarm script from GitHub (kept separate so the main
 	script stays small enough to paste into an executor). Not meant to be run on its own.
 
@@ -585,6 +585,7 @@ return function(ctx)
 
 	---------------- alt side ----------------
 	local REQUEST_TIMEOUT = 20 -- seconds for the master to accept
+	local unanswered = 0 -- requests in a row the master didn't answer
 	local CONFIRM_DELAY = 4.5  -- the game unlocks Accept 4s after the last change
 	local SUCCESS_TIMEOUT = 30 -- seconds for the master to confirm
 
@@ -651,9 +652,17 @@ return function(ctx)
 				return (tonumber(arg) or 5) + 1
 			elseif kind == "Disable" or kind == "FriendsOnly" then
 				return 30
+			elseif kind == nil or kind == "Decline" or kind == "Busy" then
+				-- the master isn't taking trades right now (auto accept off, fighting the boss...):
+				-- wait longer each time so farming here isn't stuck paused on requests
+				unanswered += 1
+				local waitTime = math.min(15 * unanswered, 60)
+				TradeInfo.message ..= (" — trying again in %ds"):format(waitTime)
+				return waitTime
 			end
 			return 5
 		end
+		unanswered = 0
 
 		-- 2. offer
 		TradeInfo.phase = "Offering"
@@ -783,19 +792,18 @@ return function(ctx)
 
 	-- True while a trade window, a trade request or one of our own trades is in progress
 	local function tradeActive()
+		if TradeInfo.partner ~= nil or waitingToAccept then
+			return true
+		end
 		local trade = getTradeFrame()
-		local menus = trade and trade.Parent
 		if trade and trade.Visible then
 			return true
 		end
-		-- the game's "Trade Requested" / "Trade Request Sent" prompt moves between Menus.Trade and Menus
-		for _, parent in ipairs({ trade, menus }) do
-			local prompt = parent and parent:FindFirstChild("Prompt")
-			if prompt and prompt.Visible then
-				return true
-			end
-		end
-		return TradeInfo.partner ~= nil or waitingToAccept
+		-- while it's showing, the game moves its trade prompt out of Menus.Trade into Menus
+		local menus = trade and trade.Parent
+		local prompt = menus and menus:FindFirstChild("Prompt")
+		local title = prompt and prompt:FindFirstChild("Title")
+		return prompt ~= nil and prompt.Visible and title ~= nil and tostring(title.Text):find("Trade") ~= nil
 	end
 
 	------------------------------------------------------------------
@@ -1430,6 +1438,438 @@ return function(ctx)
 	applyRoleVisibility()
 
 	------------------------------------------------------------------
+	-- Auto Abilities
+	-- Abilities are used with Events.Abilities:FireServer(id), the same call the
+	-- game's own ability bar makes. data.cooldowns[id] is the server time each
+	-- ability is ready again. Two modes, which can run together:
+	--   • Groups: ordered lists of abilities. A group waits until every ability in
+	--     it is ready, then uses them in order (e.g. Decoy -> Super Saiyan -> Hamburger).
+	--     An ability can only be in one group.
+	--   • When ready: every other ability is used the moment its cooldown ends.
+	------------------------------------------------------------------
+	local abilitiesTab = ctx.AbilitiesTab
+	local AbilitiesEvent = Events and Events:FindFirstChild("Abilities")
+	local attacking = type(ctx.attacking) == "function" and ctx.attacking or function()
+		return true
+	end
+
+	local AbilitiesData = requireWithin("Settings", "AbilitiesData", 3)
+	if type(AbilitiesData) ~= "table" then
+		AbilitiesData = {}
+	end
+
+	local ABILITY_IDS = {}
+	for id in pairs(AbilitiesData) do
+		if tonumber(id) then
+			table.insert(ABILITY_IDS, tostring(id))
+		end
+	end
+	table.sort(ABILITY_IDS, function(a, b)
+		return tonumber(a) < tonumber(b)
+	end)
+
+	local function abilityName(id)
+		local info = AbilitiesData[tostring(id)]
+		return type(info) == "table" and tostring(info.title) or ("Ability " .. tostring(id))
+	end
+
+	local function abilityLabel(id)
+		return ("[%s] %s"):format(tostring(id), abilityName(id))
+	end
+
+	local GROUP_COUNT = 4
+	local STEPS_PER_GROUP = 5
+
+	local Abil = {
+		Asap = false, -- use abilities the moment they're ready (anything not in an active group)
+		GroupsOn = false,
+		OnlyAttacking = false,
+		Never = {}, -- [id] = true, skipped by "when ready"
+		Gap = 0.5, -- seconds between abilities
+		used = 0,
+		message = "-",
+		pending = {}, -- [id] = os.clock() it was sent, until the server's cooldown shows up
+	}
+
+	local Groups = {}
+	for g = 1, GROUP_COUNT do
+		Groups[g] = { enabled = false, steps = {}, runs = 0, status = "-" }
+	end
+
+	local function serverNow()
+		local ok, t = pcall(function()
+			return workspace:GetServerTimeNow()
+		end)
+		return ok and t or os.time()
+	end
+
+	-- The game's ability bar slot for an id (its Lock shows whether you've unlocked it)
+	local function getSlot(id)
+		local gui = player:FindFirstChild("PlayerGui")
+		local bar = gui and gui:FindFirstChild("Abilities")
+		local slots = bar and bar:FindFirstChild("Slots")
+		return slots and slots:FindFirstChild(tostring(id))
+	end
+
+	-- "ready", "locked", or "cooldown" plus seconds left
+	local function abilityState(id, data)
+		local slot = getSlot(id)
+		local lock = slot and slot:FindFirstChild("Lock")
+		if lock and lock.Visible then
+			return "locked", 0
+		end
+		local cooldowns = data and type(data.cooldowns) == "table" and data.cooldowns or {}
+		local readyAt = tonumber(cooldowns[id] or cooldowns[tonumber(id)])
+		local left = readyAt and readyAt - serverNow() or 0
+		local sent = Abil.pending[id]
+		if sent then
+			if left > 0 or os.clock() - sent > 15 then
+				Abil.pending[id] = nil -- the server has taken it (or ignored it; try again)
+			else
+				return "cooldown", 1
+			end
+		end
+		if left > 0 then
+			return "cooldown", left
+		end
+		return "ready", 0
+	end
+
+	local function useAbility(id)
+		if not AbilitiesEvent then
+			error("ReplicatedStorage.Events.Abilities wasn't found", 0)
+		end
+		AbilitiesEvent:FireServer(tostring(id))
+		Abil.pending[id] = os.clock()
+		Abil.used += 1
+		log("Used ability", id, abilityName(id))
+	end
+
+	local function formatLeft(seconds)
+		seconds = math.max(0, math.ceil(seconds))
+		local h, m, s = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60
+		if h > 0 then
+			return ("%dh %02dm"):format(h, m)
+		end
+		return ("%dm %02ds"):format(m, s)
+	end
+
+	-- Steps of a group in order, skipping empty ones
+	local function groupSteps(g)
+		local list = {}
+		for k = 1, STEPS_PER_GROUP do
+			local id = Groups[g].steps[k]
+			if id then
+				table.insert(list, id)
+			end
+		end
+		return list
+	end
+
+	-- Abilities that belong to a group that's switched on (the "when ready" mode leaves these alone)
+	local function groupedIds()
+		local set = {}
+		if Abil.GroupsOn then
+			for g = 1, GROUP_COUNT do
+				if Groups[g].enabled then
+					for _, id in ipairs(groupSteps(g)) do
+						set[id] = true
+					end
+				end
+			end
+		end
+		return set
+	end
+
+	-- Why abilities can't be used right now, or nil
+	local function abilityBlocker()
+		if bossBusy() then
+			return "boss fight"
+		end
+		local char = player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if root and root.Position.Y > 5000 then
+			return "can't use abilities on the moon"
+		end
+		if tradeActive() then
+			return "trade"
+		end
+		if Abil.OnlyAttacking and not attacking() then
+			return "waiting for Auto Attack"
+		end
+		return nil
+	end
+
+	task.spawn(function()
+		while alive() do
+			task.wait(0.5)
+			if Abil.Asap or Abil.GroupsOn then
+				local ok, err = pcall(function()
+					local blocker = abilityBlocker()
+					if blocker then
+						Abil.message = "Paused: " .. blocker
+						return
+					end
+					local data, dataErr = getData()
+					if not data then
+						Abil.message = dataErr
+						return
+					end
+
+					-- groups first, in order
+					if Abil.GroupsOn then
+						for g = 1, GROUP_COUNT do
+							local group = Groups[g]
+							local steps = groupSteps(g)
+							if group.enabled and #steps > 0 then
+								local waitingOn, longest, locked = nil, 0, nil
+								for _, id in ipairs(steps) do
+									local state, left = abilityState(id, data)
+									if state == "locked" then
+										locked = id
+									elseif state == "cooldown" and left > longest then
+										waitingOn, longest = id, left
+									end
+								end
+								if locked then
+									group.status = "Locked: " .. abilityName(locked)
+								elseif waitingOn then
+									group.status = ("Waiting on %s (%s)"):format(abilityName(waitingOn), formatLeft(longest))
+								else
+									group.status = "Using..."
+									for i, id in ipairs(steps) do
+										if abilityBlocker() then
+											break
+										end
+										if i > 1 then
+											task.wait(Abil.Gap)
+										end
+										useAbility(id)
+									end
+									group.runs += 1
+									group.status = ("Used (%d time%s)"):format(group.runs, group.runs == 1 and "" or "s")
+									task.wait(Abil.Gap)
+								end
+							elseif group.enabled then
+								group.status = "Empty"
+							else
+								group.status = "Off"
+							end
+						end
+					end
+
+					-- everything else, the moment it's ready
+					if Abil.Asap then
+						local grouped = groupedIds()
+						for _, id in ipairs(ABILITY_IDS) do
+							if not grouped[id] and not Abil.Never[id] and abilityState(id, data) == "ready" then
+								if abilityBlocker() then
+									break
+								end
+								useAbility(id)
+								task.wait(Abil.Gap)
+							end
+						end
+					end
+					Abil.message = "Running"
+				end)
+				if not ok then
+					Abil.message = "Error: " .. tostring(err)
+					warn("[EggFarm] Ability error:", err)
+				end
+			else
+				Abil.message = "Off"
+			end
+		end
+	end)
+
+	local function abilityText()
+		local data = getData()
+		local lines = { bold("Status: ") .. esc(Abil.message), bold("Abilities used: ") .. Abil.used }
+		local grouped = groupedIds()
+		for _, id in ipairs(ABILITY_IDS) do
+			local state, left = abilityState(id, data)
+			local text
+			if state == "locked" then
+				text = color("locked", GREY)
+			elseif state == "cooldown" then
+				text = color(formatLeft(left), YELLOW)
+			else
+				text = color("ready", GREEN)
+			end
+			local tag = grouped[id] and " (group)" or (Abil.Never[id] and " (never)" or "")
+			table.insert(lines, esc(abilityName(id)) .. tag .. ": " .. text)
+		end
+		return table.concat(lines, "\n")
+	end
+
+	---------------- Abilities tab ----------------
+	local abilityOptions = {}
+	for _, id in ipairs(ABILITY_IDS) do
+		table.insert(abilityOptions, abilityLabel(id))
+	end
+
+	local AbilCard = abilitiesTab:Card({ Title = "Auto Abilities", Side = "Left" })
+	AbilCard:Toggle({
+		Name = "Use Abilities When Ready",
+		Flag = "AbilityAsap",
+		Keybind = true,
+		Tooltip = "Uses each unlocked ability the moment its cooldown ends. "
+			.. "Abilities in a group that's switched on are left to that group.",
+		Callback = function(v)
+			Abil.Asap = v
+		end,
+	})
+	AbilCard:Toggle({
+		Name = "Use Ability Groups",
+		Flag = "AbilityGroupsOn",
+		Keybind = true,
+		Tooltip = "Runs the groups below: each one waits until all of its abilities are ready, then uses them in order.",
+		Callback = function(v)
+			Abil.GroupsOn = v
+		end,
+	})
+	AbilCard:Toggle({
+		Name = "Only While Auto Attack Is Attacking",
+		Flag = "AbilityOnlyAttacking",
+		Tooltip = "Holds abilities until Auto Attack is hitting your chicken, so boosts like Super Saiyan aren't wasted.",
+		Callback = function(v)
+			Abil.OnlyAttacking = v
+		end,
+	})
+	AbilCard:Dropdown({
+		Name = "Never Use When Ready",
+		Multi = true,
+		Options = abilityOptions,
+		Placeholder = "None",
+		Flag = "AbilityNever",
+		Tooltip = "Skipped by Use Abilities When Ready (groups can still use them). "
+			.. "Handy for Decoy and Hamburger, which work best right before / after a specific ability.",
+		Callback = function(labels)
+			local set = {}
+			for _, label in ipairs(labels or {}) do
+				local id = idFromLabel(label)
+				if id then
+					set[tostring(id)] = true
+				end
+			end
+			Abil.Never = set
+		end,
+	})
+	AbilCard:Slider({
+		Name = "Delay Between Abilities",
+		Min = 0.2,
+		Max = 3,
+		Increment = 0.1,
+		Default = 0.5,
+		Suffix = "s",
+		Flag = "AbilityGap",
+		Callback = function(v)
+			Abil.Gap = v
+		end,
+	})
+
+	local AbilLive = abilitiesTab:Card({ Title = "Live", Side = "Right" })
+	local abilityPara = AbilLive:Paragraph({ Content = "-" })
+
+	-- Group cards: one dropdown per step. Each ability can only be picked once across
+	-- every group, so picking it anywhere removes it from all the other lists.
+	local stepDropdowns = {} -- [g][k] = dropdown
+	local groupParas = {}
+	local refreshing = false
+
+	local function refreshStepOptions()
+		if refreshing then
+			return
+		end
+		refreshing = true
+		local used = {}
+		for g = 1, GROUP_COUNT do
+			for k = 1, STEPS_PER_GROUP do
+				local id = Groups[g].steps[k]
+				if id then
+					used[id] = true
+				end
+			end
+		end
+		for g = 1, GROUP_COUNT do
+			for k = 1, STEPS_PER_GROUP do
+				local own = Groups[g].steps[k]
+				local options = { "None" }
+				for _, id in ipairs(ABILITY_IDS) do
+					if not used[id] or id == own then
+						table.insert(options, abilityLabel(id))
+					end
+				end
+				local dropdown = stepDropdowns[g] and stepDropdowns[g][k]
+				if dropdown then
+					pcall(dropdown.Refresh, dropdown, options, true)
+				end
+			end
+		end
+		refreshing = false
+	end
+
+	local ORDINALS = { "1st", "2nd", "3rd", "4th", "5th" }
+	for g = 1, GROUP_COUNT do
+		local card = abilitiesTab:Card({ Title = "Group " .. g, Side = g % 2 == 1 and "Left" or "Right" })
+		card:Toggle({
+			Name = "Use Group " .. g,
+			Flag = "AbilityGroup" .. g,
+			Callback = function(v)
+				Groups[g].enabled = v
+			end,
+		})
+		stepDropdowns[g] = {}
+		for k = 1, STEPS_PER_GROUP do
+			stepDropdowns[g][k] = card:Dropdown({
+				Name = ORDINALS[k],
+				Options = { "None", table.unpack(abilityOptions) },
+				Default = "None",
+				Flag = ("AbilityGroup%d_%d"):format(g, k),
+				Callback = function(label)
+					local id = idFromLabel(label)
+					id = id and tostring(id) or nil
+					-- an ability already used in another step can't be picked twice
+					if id then
+						for g2 = 1, GROUP_COUNT do
+							for k2 = 1, STEPS_PER_GROUP do
+								if (g2 ~= g or k2 ~= k) and Groups[g2].steps[k2] == id then
+									id = nil
+								end
+							end
+						end
+					end
+					Groups[g].steps[k] = id
+					if not id and label ~= "None" and stepDropdowns[g] and stepDropdowns[g][k] then
+						pcall(stepDropdowns[g][k].Set, stepDropdowns[g][k], "None", true)
+					end
+					refreshStepOptions()
+				end,
+			})
+		end
+		groupParas[g] = card:Paragraph({ Content = "-" })
+	end
+	refreshStepOptions()
+
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				abilityPara:Set(abilityText())
+				for g = 1, GROUP_COUNT do
+					local names = {}
+					for _, id in ipairs(groupSteps(g)) do
+						table.insert(names, esc(abilityName(id)))
+					end
+					groupParas[g]:Set(bold("Order: ") .. (#names > 0 and table.concat(names, " → ") or "empty")
+						.. "\n" .. bold("Status: ") .. esc(Groups[g].status))
+				end
+			end)
+			task.wait(1)
+		end
+	end)
+
+	------------------------------------------------------------------
 	-- Live card
 	------------------------------------------------------------------
 	task.spawn(function()
@@ -1448,7 +1888,13 @@ return function(ctx)
 	-- Lets the main script pause farming while a trade is going on
 	return {
 		busy = function()
-			return TradeInfo.partner ~= nil or waitingToAccept
+			if waitingToAccept then
+				return true, "master waiting to accept"
+			end
+			if TradeInfo.partner ~= nil then
+				return true, ("%s with %s"):format(string.lower(TradeInfo.phase), tostring(TradeInfo.partner))
+			end
+			return false
 		end,
 	}
 end
