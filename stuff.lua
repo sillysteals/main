@@ -3,7 +3,9 @@
 	UI: Ember (loaded from GitHub)
 
 	• Everything is controlled from the menu. K hides / shows it.
-	• Settings save automatically (workspace/EggFarmSim/Autofarm.json).
+	• Settings save automatically, per account (workspace/EggFarmSim/Autofarm-<UserId>.json).
+	• The Items tab (auto sell / open boxes) and Alt / Master trading are loaded from a
+	  second file on GitHub (egg_farm_trading.lua).
 	• Running the script again closes the old menu and stops the old loops.
 	• Anti-AFK is always on while the script is running.
 ]]
@@ -176,6 +178,34 @@ local REMOTE_DELAY = 0.1
 local hasTouch = typeof(firetouchinterest) == "function"
 local bossActive = false -- boss farm owns the character (pauses diamonds)
 
+-- Everything pauses while a trade is going on (on the alt and the master), so the
+-- trade isn't disturbed. A boss fight is more important, so it never pauses and
+-- the trading code doesn't start a trade during one.
+local tradingApi -- set once the Items / Alt / Master file loads
+local function tradePaused()
+	if bossActive then
+		return false
+	end
+	local gui = player:FindFirstChild("PlayerGui")
+	local menus = gui and gui:FindFirstChild("Menus")
+	local trade = menus and menus:FindFirstChild("Trade")
+	if trade and trade.Visible then
+		return true
+	end
+	-- the game's trade prompt moves between Menus.Trade and Menus
+	for _, parent in ipairs({ trade, menus }) do
+		local prompt = parent and parent:FindFirstChild("Prompt")
+		if prompt and prompt.Visible then
+			return true
+		end
+	end
+	if tradingApi and type(tradingApi.busy) == "function" then
+		local ok, busy = pcall(tradingApi.busy)
+		return ok and busy == true
+	end
+	return false
+end
+
 local function log(...)
 	if State.Debug then
 		print("[EggFarm]", ...)
@@ -339,7 +369,7 @@ local function collectDiamonds(folder)
 		local original = root.CFrame
 
 		local function running()
-			return alive() and State.Diamonds and not bossActive
+			return alive() and State.Diamonds and not bossActive and not tradePaused()
 		end
 
 		while running() and folder.Parent do
@@ -388,7 +418,7 @@ end
 
 task.spawn(function()
 	while alive() do
-		if State.Diamonds and not bossActive then
+		if State.Diamonds and not bossActive and not tradePaused() then
 			local folder = getDiamondFolder()
 			if countDiamonds(folder) > 0 then
 				collectDiamonds(folder)
@@ -422,7 +452,7 @@ end
 task.spawn(function()
 	while alive() do
 		local root = getRoot()
-		if State.Meat and root then
+		if State.Meat and root and not tradePaused() then
 			local parts = getMeatParts(root)
 			if #parts > 0 then
 				log(("Meat: touching %d"):format(#parts))
@@ -436,7 +466,7 @@ end)
 
 -- Instant: grab new meat the moment it spawns
 track(workspace.ChildAdded:Connect(function(obj)
-	if obj.Name ~= "Meat" or not (alive() and State.Meat) then
+	if obj.Name ~= "Meat" or not (alive() and State.Meat) or tradePaused() then
 		return
 	end
 	task.spawn(function()
@@ -452,7 +482,7 @@ track(workspace.ChildAdded:Connect(function(obj)
 		until not obj.Parent or os.clock() - start > 3
 
 		local root = getRoot()
-		if not (alive() and State.Meat and part and part.Parent and root and inRange(root, part)) then
+		if not (alive() and State.Meat and part and part.Parent and root and inRange(root, part)) or tradePaused() then
 			return
 		end
 		log("Meat: new item, touching", part:GetFullName())
@@ -496,7 +526,7 @@ task.spawn(function()
 			for _, d in ipairs(folder:GetDescendants()) do
 				if d:IsA("TouchTransmitter") then
 					count += 1
-					if State.Grapes then
+					if State.Grapes and not tradePaused() then
 						task.spawn(fireGrape, d)
 					end
 				end
@@ -522,7 +552,7 @@ task.spawn(function()
 			conn, hooked = nil, folder
 			if folder then
 				conn = folder.DescendantAdded:Connect(function(d)
-					if alive() and State.Grapes and d:IsA("TouchTransmitter") then
+					if alive() and State.Grapes and d:IsA("TouchTransmitter") and not tradePaused() then
 						task.defer(fireGrape, d)
 					end
 				end)
@@ -591,7 +621,7 @@ end
 
 local function upgradeList(ids, force)
 	for _, id in ipairs(ids) do
-		if not (alive() and (force or State.HeroFarm)) then
+		if not (alive() and (force or (State.HeroFarm and not tradePaused()))) then
 			return
 		end
 		maxUpgradeHero(id)
@@ -669,7 +699,7 @@ end
 
 task.spawn(function()
 	while alive() do
-		if State.HeroFarm and os.clock() >= heroNextTick then
+		if State.HeroFarm and os.clock() >= heroNextTick and not tradePaused() then
 			heroNextTick = os.clock() + HERO_TICK_INTERVAL
 			heroFarmTick(false)
 		end
@@ -721,7 +751,7 @@ end
 -- (or 2s) so the same level is never sent twice.
 local advancing = false
 local function tryAdvance()
-	if advancing or not (alive() and State.AutoAdvance) or not readyToAdvance() then
+	if advancing or not (alive() and State.AutoAdvance) or tradePaused() or not readyToAdvance() then
 		return
 	end
 	advancing = true
@@ -805,7 +835,7 @@ local function getCountdown()
 	local text = label.Text:gsub(",", "")
 	local m, s = text:match("(%d+):(%d+)")
 	if m then
-		return tonumber(m) * 60 + tonumber(s)
+		return (tonumber(m) or 0) * 60 + (tonumber(s) or 0)
 	end
 	return tonumber(text:match("%d+%.?%d*"))
 end
@@ -1117,7 +1147,7 @@ end
 local function rerollPass(force)
 	local count = 0
 	for _, id in ipairs(getOwnedTrophies()) do
-		if not (alive() and (force or State.AutoReroll)) then
+		if not (alive() and (force or (State.AutoReroll and not tradePaused()))) then
 			break
 		end
 		if not isSaved(id) then
@@ -1135,7 +1165,7 @@ end
 
 task.spawn(function()
 	while alive() do
-		if State.AutoReroll then
+		if State.AutoReroll and not tradePaused() then
 			-- rescans each pass, so trophies that rolled into a saved ID are left alone
 			if rerollPass(false) == 0 then
 				task.wait(1)
@@ -1170,6 +1200,9 @@ local function farmText()
 		table.insert(lines, bold("Farm: ") .. color("Not found", RED) .. " — use Re-find My Farm")
 	end
 	table.insert(lines, bold("Grape transmitters: ") .. grapeTransmitters)
+	if tradePaused() then
+		table.insert(lines, color("Paused while a trade is going on", YELLOW))
+	end
 	if not hasTouch then
 		table.insert(lines, color("firetouchinterest isn't supported by this executor", RED))
 	end
@@ -1302,6 +1335,9 @@ local HeroTab = Window:Tab({ Name = "Heroes" })
 local ProgressTab = Window:Tab({ Name = "Progress", Columns = 1 })
 local BossTab = Window:Tab({ Name = "Boss" })
 local TrophyTab = Window:Tab({ Name = "Trophies" })
+local ItemsTab = Window:Tab({ Name = "Items" })
+Window:Section("Accounts")
+local TradeTab = Window:Tab({ Name = "Alt / Master" })
 Window:Section("Info")
 local StatusTab = Window:Tab({ Name = "Status" })
 Window:Section("Settings")
@@ -1483,7 +1519,8 @@ Advance:Button({
 	Callback = function()
 		local current, needed = getProgress()
 		if current and needed and current < needed then
-			return notify("Progress", ("Not ready yet (%d / %d)."):format(current, needed))
+			notify("Progress", ("Not ready yet (%d / %d)."):format(current, needed))
+			return
 		end
 		task.spawn(advance)
 	end,
@@ -1569,6 +1606,48 @@ Reroll:Button({
 
 local TrophyLive = TrophyTab:Card({ Title = "Live", Side = "Right" })
 live.trophies = TrophyLive:Paragraph({ Content = "-" })
+
+---------------- Items + Alt / Master ----------------
+-- Live in their own file on GitHub so this script stays small enough to paste.
+-- If it can't load, only those two tabs are affected: they show why, everything else runs.
+local TRADING_URL = "https://raw.githubusercontent.com/sillysteals/main/refs/heads/main/egg_farm_trading.lua"
+local tradingOk, tradingErr = pcall(function()
+	local source = game:HttpGet(TRADING_URL)
+	if type(source) ~= "string" or source:sub(1, 3) == "404" then
+		error("egg_farm_trading.lua isn't on GitHub at that link yet (404).", 0)
+	end
+	local chunk, compileErr = loadstring(source)
+	if not chunk then
+		error("Couldn't compile egg_farm_trading.lua: " .. tostring(compileErr), 0)
+	end
+	local setup = chunk()
+	if type(setup) ~= "function" then
+		error("The file at that link isn't egg_farm_trading.lua.", 0)
+	end
+	tradingApi = setup({
+		Tab = TradeTab,
+		bossBusy = function()
+			return bossActive
+		end,
+		ItemsTab = ItemsTab,
+		alive = alive,
+		track = track,
+		log = log,
+		notify = notify,
+		idFromLabel = idFromLabel,
+		heroOptions = heroOptions,
+	})
+end)
+if not tradingOk then
+	warn("[EggFarm] Items / trading didn't load:", tradingErr)
+	for _, tab in ipairs({ ItemsTab, TradeTab }) do
+		tab:Card({ Title = "This tab didn't load" }):Paragraph({
+			Content = color(esc(tradingErr), RED)
+				.. "\n\nUpload <b>egg_farm_trading.lua</b> next to ember.lua on GitHub, then run the script again:\n"
+				.. esc(TRADING_URL),
+		})
+	end
+end
 
 ---------------- Status ----------------
 local FarmCard = StatusTab:Card({ Title = "Farm", Side = "Left" })
@@ -1656,8 +1735,13 @@ end)
 ------------------------------------------------------------------
 -- Saved settings (load now, auto-save on change)
 ------------------------------------------------------------------
-local CONFIG = "Autofarm"
+-- Per account, so alts and the master on one PC keep separate settings.
+-- First run on an account starts from the old shared file.
+local CONFIG = "Autofarm-" .. player.UserId
 local restored = Ember:LoadConfig(CONFIG)
+if not restored then
+	restored = Ember:LoadConfig("Autofarm")
+end
 
 -- One-time move from the old RightShift default to K (a key you pick later sticks)
 pcall(function()
@@ -1699,6 +1783,9 @@ if not hasTouch then
 end
 if heroDataError then
 	table.insert(lines, "Couldn't read HeroesData, so hero names and upgrade counts are missing.")
+end
+if not tradingOk then
+	table.insert(lines, "The Items and Alt / Master tabs didn't load (open one to see why).")
 end
 table.insert(lines, "Press " .. tostring(Ember.Flags.Ember_MenuKey or "K") .. " to hide or show the menu.")
 Ember:Notify({ Title = "Egg Farm loaded", Content = table.concat(lines, "\n"), Duration = 6 })
