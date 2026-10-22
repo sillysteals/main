@@ -5,6 +5,7 @@
 	• Everything is controlled from the menu. K hides / shows it.
 	• Settings save automatically (workspace/EggFarmSim/Autofarm.json).
 	• Running the script again closes the old menu and stops the old loops.
+	• Anti-AFK is always on while the script is running.
 ]]
 
 local EMBER_URL = "https://raw.githubusercontent.com/sillysteals/main/refs/heads/main/ember.lua"
@@ -106,6 +107,17 @@ local function track(conn)
 	table.insert(connections, conn)
 	return conn
 end
+
+------------------------------------------------------------------
+-- Anti-AFK (always on while the script runs)
+-- Roblox fires Idled after ~20 minutes without input; a fake right-click resets it.
+------------------------------------------------------------------
+local VirtualUser = game:GetService("VirtualUser")
+
+track(player.Idled:Connect(function()
+	VirtualUser:CaptureController()
+	VirtualUser:ClickButton2(Vector2.new())
+end))
 
 ------------------------------------------------------------------
 -- State (driven by the menu) & stats
