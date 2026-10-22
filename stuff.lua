@@ -163,6 +163,7 @@ local Stats = {
 	Meat = 0,
 	Grapes = 0,
 	HeroBuyAttempts = 0,
+	Attacks = 0,
 	HeroTicks = 0,
 	BatchPasses = 0,
 	Advances = 0,
@@ -346,6 +347,77 @@ local function getFarm(forceRefresh)
 	end
 	return cachedFarm
 end
+
+------------------------------------------------------------------
+-- Auto Attack (your own farm's chicken)
+-- The attack remote doesn't say what it hits: the server picks the nearest
+-- farm chicken within 8 studs of you. So this keeps you next to your own
+-- chicken and sends attacks as fast as the rate setting allows.
+------------------------------------------------------------------
+local ATTACK_KEY = "219629d5067eddcdce55ed7968e9b53f" -- sent by the game with every attack
+local ATTACK_RANGE = 8 -- the game's own reach (without the Tommy Gun)
+
+local Attack = {
+	Enabled = false,
+	Rate = 30, -- attacks per second
+	StayNear = true,
+	status = "Off",
+}
+
+local function getMyChicken()
+	local farm = getFarm()
+	local chicken = farm and farm:FindFirstChild("Chicken")
+	return chicken and chicken:IsA("BasePart") and chicken or nil
+end
+
+-- A spot a few studs from the chicken, toward the farm's middle
+local function spotNearChicken(chicken)
+	local farm = chicken.Parent
+	local center = farm and farm:IsA("Model") and farm:GetPivot().Position or chicken.Position
+	local away = Vector3.new(center.X - chicken.Position.X, 0, center.Z - chicken.Position.Z)
+	away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
+	return chicken.Position + away * 4 + Vector3.new(0, 1, 0)
+end
+
+task.spawn(function()
+	local owed, last = 0, os.clock()
+	while alive() do
+		task.wait()
+		local dt = os.clock() - last
+		last = os.clock()
+
+		if not Attack.Enabled then
+			Attack.status, owed = "Off", 0
+		elseif bossActive then
+			Attack.status, owed = "Paused: boss fight", 0
+		elseif tradePaused() then
+			Attack.status, owed = "Paused: trade", 0
+		else
+			local chicken, root = getMyChicken(), getRoot()
+			if not chicken then
+				Attack.status, owed = "Waiting for your chicken", 0
+			elseif root then
+				local dist = (root.Position - chicken.Position).Magnitude
+				-- walk back over (only when nothing else is moving the character)
+				if dist > ATTACK_RANGE - 1 and Attack.StayNear and not tpBusy then
+					placeAt(root, spotNearChicken(chicken))
+					dist = (root.Position - chicken.Position).Magnitude
+				end
+				if dist <= ATTACK_RANGE then
+					Attack.status = "Attacking"
+					owed = math.min(owed + dt * Attack.Rate, Attack.Rate) -- never bank more than a second's worth
+					while owed >= 1 do
+						owed -= 1
+						WeaponEvent:FireServer("self", ATTACK_KEY)
+						Stats.Attacks += 1
+					end
+				else
+					Attack.status, owed = "Too far from your chicken", 0
+				end
+			end
+		end
+	end
+end)
 
 ------------------------------------------------------------------
 -- Diamonds
@@ -1016,7 +1088,7 @@ local function fightBoss()
 				end
 				placeAt(root, attackPos)
 				pcall(function()
-					WeaponEvent:FireServer("alien", "")
+					WeaponEvent:FireServer("alien", ATTACK_KEY)
 				end)
 				Stats.BossAttacks += 1
 			end
@@ -1301,16 +1373,13 @@ local function trophyText()
 	}, "\n")
 end
 
--- workspace.DistributedGameTime is replicated from the server: seconds since the server started
+-- Roblox doesn't let clients see how long a server has been up (DistributedGameTime
+-- only counts from when you joined, despite its name), so this shows your time in it.
 local function serverText()
 	local seconds = math.max(0, math.floor(workspace.DistributedGameTime))
-	local d, h = math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600)
-	local m, s = math.floor(seconds % 3600 / 60), seconds % 60
-	local age = d > 0 and ("%dd %dh %02dm"):format(d, h, m) or ("%dh %02dm %02ds"):format(h, m, s)
-	local started = os.date("%I:%M %p", os.time() - seconds):gsub("^0", "")
+	local h, m, s = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60
 	return table.concat({
-		bold("Server age: ") .. age,
-		bold("Started at: ") .. started .. " (your time)",
+		bold("In this server: ") .. ("%dh %02dm %02ds"):format(h, m, s),
 		bold("Players: ") .. #Players:GetPlayers() .. " / " .. Players.MaxPlayers,
 	}, "\n")
 end
@@ -1364,12 +1433,12 @@ Window = Ember:CreateWindow({
 })
 
 Window:Section("Farming")
-local CollectTab = Window:Tab({ Name = "Collect" })
+local MainTab = Window:Tab({ Name = "Main" })
 local HeroTab = Window:Tab({ Name = "Heroes" })
-local ProgressTab = Window:Tab({ Name = "Progress", Columns = 1 })
 local BossTab = Window:Tab({ Name = "Boss" })
 local TrophyTab = Window:Tab({ Name = "Trophies" })
 local ItemsTab = Window:Tab({ Name = "Items" })
+local AbilitiesTab = Window:Tab({ Name = "Abilities" })
 Window:Section("Accounts")
 local TradeTab = Window:Tab({ Name = "Alt / Master" })
 Window:Section("Info")
@@ -1380,8 +1449,73 @@ local SettingsTab = Window:Tab({ Name = "Settings" })
 -- Live paragraphs, refreshed once a second at the bottom of the file
 local live = {}
 
+---------------- Main tab: attack + auto advance on top, collecting below ----------------
+---------------- Attack ----------------
+local AttackCard = MainTab:Card({ Title = "Auto Attack", Side = "Left" })
+AttackCard:Toggle({
+	Name = "Auto Attack My Chicken",
+	Flag = "AutoAttack",
+	Keybind = true,
+	Tooltip = "Attacks your own farm's chicken nonstop. Pauses for boss fights and trades.",
+	Callback = function(v)
+		Attack.Enabled = v
+	end,
+})
+AttackCard:Slider({
+	Name = "Attacks Per Second",
+	Min = 1,
+	Max = 60,
+	Increment = 1,
+	Default = 30,
+	Flag = "AttackRate",
+	Tooltip = "The game normally attacks at your multiplier (CPS + wings tier) per second. "
+		.. "Higher is sent if you ask for it, but the server may only count up to its own limit.",
+	Callback = function(v)
+		Attack.Rate = v
+	end,
+})
+AttackCard:Toggle({
+	Name = "Stay Next to My Chicken",
+	Default = true,
+	Flag = "AttackStayNear",
+	Tooltip = "Teleports you back beside your chicken whenever you're out of reach (8 studs). "
+		.. "Diamond collection and the boss fight still take you away when they need to.",
+	Callback = function(v)
+		Attack.StayNear = v
+	end,
+})
+live.attack = AttackCard:Paragraph({ Content = "-" })
+
+---------------- Auto Advance ----------------
+local Advance = MainTab:Card({ Title = "Auto Advance", Side = "Right" })
+Advance:Toggle({
+	Name = "Auto Advance When Ready",
+	Flag = "AutoAdvance",
+	Keybind = true,
+	Tooltip = "Advances the moment the chicken bar is full.",
+	Callback = function(v)
+		State.AutoAdvance = v
+		if v then
+			task.spawn(tryAdvance)
+		end
+	end,
+})
+live.chickens = Advance:Progress({ Name = "Chickens" })
+live.progress = Advance:Paragraph({ Content = "-" })
+Advance:Button({
+	Name = "Advance Now",
+	Callback = function()
+		local current, needed = getProgress()
+		if current and needed and current < needed then
+			notify("Progress", ("Not ready yet (%d / %d)."):format(current, needed))
+			return
+		end
+		task.spawn(advance)
+	end,
+})
+
 ---------------- Collect ----------------
-local Diamonds = CollectTab:Card({ Title = "Diamonds", Side = "Left" })
+local Diamonds = MainTab:Card({ Title = "Diamonds", Side = "Left" })
 Diamonds:Toggle({
 	Name = "Auto Collect Diamonds",
 	Flag = "AutoDiamonds",
@@ -1422,7 +1556,7 @@ Diamonds:Button({
 	end,
 })
 
-local Pickups = CollectTab:Card({ Title = "Meat & Grapes", Side = "Right" })
+local Pickups = MainTab:Card({ Title = "Meat & Grapes", Side = "Right" })
 Pickups:Toggle({
 	Name = "Auto Collect Meat",
 	Flag = "AutoMeat",
@@ -1532,34 +1666,6 @@ HeroManual:Button({
 	end,
 })
 
----------------- Progress ----------------
-local Advance = ProgressTab:Card({ Title = "Auto Advance" })
-Advance:Toggle({
-	Name = "Auto Advance When Ready",
-	Flag = "AutoAdvance",
-	Keybind = true,
-	Tooltip = "Advances the moment the chicken bar is full.",
-	Callback = function(v)
-		State.AutoAdvance = v
-		if v then
-			task.spawn(tryAdvance)
-		end
-	end,
-})
-live.chickens = Advance:Progress({ Name = "Chickens" })
-live.progress = Advance:Paragraph({ Content = "-" })
-Advance:Button({
-	Name = "Advance Now",
-	Callback = function()
-		local current, needed = getProgress()
-		if current and needed and current < needed then
-			notify("Progress", ("Not ready yet (%d / %d)."):format(current, needed))
-			return
-		end
-		task.spawn(advance)
-	end,
-})
-
 ---------------- Boss ----------------
 local BossFarm = BossTab:Card({ Title = "Boss Farm", Side = "Left" })
 BossFarm:Toggle({
@@ -1641,7 +1747,7 @@ Reroll:Button({
 local TrophyLive = TrophyTab:Card({ Title = "Live", Side = "Right" })
 live.trophies = TrophyLive:Paragraph({ Content = "-" })
 
----------------- Items + Alt / Master ----------------
+---------------- Items, Abilities + Alt / Master ----------------
 -- Live in their own file on GitHub so this script stays small enough to paste.
 -- If it can't load, only those two tabs are affected: they show why, everything else runs.
 local TRADING_URL = "https://raw.githubusercontent.com/sillysteals/main/refs/heads/main/egg_farm_trading.lua"
@@ -1664,6 +1770,10 @@ local tradingOk, tradingErr = pcall(function()
 			return bossActive
 		end,
 		ItemsTab = ItemsTab,
+		AbilitiesTab = AbilitiesTab,
+		attacking = function()
+			return Attack.status == "Attacking"
+		end,
 		alive = alive,
 		track = track,
 		log = log,
@@ -1674,7 +1784,7 @@ local tradingOk, tradingErr = pcall(function()
 end)
 if not tradingOk then
 	warn("[EggFarm] Items / trading didn't load:", tradingErr)
-	for _, tab in ipairs({ ItemsTab, TradeTab }) do
+	for _, tab in ipairs({ ItemsTab, AbilitiesTab, TradeTab }) do
 		tab:Card({ Title = "This tab didn't load" }):Paragraph({
 			Content = color(esc(tradingErr), RED)
 				.. "\n\nUpload <b>egg_farm_trading.lua</b> next to ember.lua on GitHub, then run the script again:\n"
@@ -1748,6 +1858,11 @@ task.spawn(function()
 				bold("Collected: ") .. Stats.Diamonds,
 				bold("Skipped: ") .. countSkipped(),
 			}, "   "))
+			local attackColor = Attack.status == "Attacking" and GREEN or Attack.status == "Off" and GREY or YELLOW
+			live.attack:Set(table.concat({
+				bold("Status: ") .. color(Attack.status, attackColor),
+				bold("Attacks sent: ") .. Stats.Attacks,
+			}, "\n"))
 			live.pickups:Set(table.concat({
 				bold("Meat touches: ") .. Stats.Meat,
 				bold("Grape touches: ") .. Stats.Grapes .. "   " .. bold("Loaded: ") .. grapeTransmitters,
@@ -1821,7 +1936,7 @@ if heroDataError then
 	table.insert(lines, "Couldn't read HeroesData, so hero names and upgrade counts are missing.")
 end
 if not tradingOk then
-	table.insert(lines, "The Items and Alt / Master tabs didn't load (open one to see why).")
+	table.insert(lines, "The Items, Abilities and Alt / Master tabs didn't load (open one to see why).")
 end
 table.insert(lines, "Press " .. tostring(Ember.Flags.Ember_MenuKey or "K") .. " to hide or show the menu.")
 Ember:Notify({ Title = "Egg Farm loaded", Content = table.concat(lines, "\n"), Duration = 6 })
