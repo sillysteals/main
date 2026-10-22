@@ -1486,6 +1486,7 @@ return function(ctx)
 		OnlyAttacking = false,
 		Never = {}, -- [id] = true, skipped by "when ready"
 		Gap = 0.5, -- seconds between abilities
+	EarlyUse = true, -- use a group's quick abilities while it waits on a slow one
 		used = 0,
 		message = "-",
 		pending = {}, -- [id] = os.clock() it was sent, until the server's cooldown shows up
@@ -1544,6 +1545,40 @@ return function(ctx)
 		Abil.used += 1
 		log("Used ability", id, abilityName(id))
 	end
+
+	-- Real cooldown of an ability: the base from AbilitiesData, cut by your equipped
+	-- weapon if it boosts that ability (same maths as the game's ability bar)
+	local WeaponCooldown = requireWithin("Settings", "WeaponCooldown", 3)
+	local function effectiveCooldown(id, data)
+		local info = AbilitiesData[id]
+		local cooldown = type(info) == "table" and tonumber(info.cooldown) or nil
+		if not cooldown then
+			return nil
+		end
+		local key = type(data.using) == "table" and data.using.weapons or nil
+		local weapons = type(data.inventory) == "table" and data.inventory.weapons or nil
+		local weapon = key ~= nil and type(weapons) == "table" and weapons[key] or nil
+		if type(weapon) == "table" and type(weapon[2]) == "table" and type(WeaponCooldown) == "table" then
+			local folder = ItemsFolder and ItemsFolder:FindFirstChild("Weapons")
+			local item = folder and folder:FindFirstChild(tostring(weapon[1]))
+			local tier = item and item:FindFirstChild("Tier")
+			local cut = tier and tonumber(WeaponCooldown[tier.Value])
+			if cut then
+				for _, ability in ipairs(weapon[2]) do
+					if tostring(ability) == id then
+						cooldown *= 1 - cut
+						break
+					end
+				end
+			end
+		end
+		return cooldown
+	end
+
+	-- Decoy and Hamburger change whatever ability comes next / came before, so using
+	-- them early would spend them on the wrong ability. They only fire with their group.
+	local NO_EARLY_USE = { ["8"] = true, ["9"] = true }
+	local EARLY_USE_MARGIN = 3 -- seconds of slack so an early use is always back in time
 
 	local function formatLeft(seconds)
 		seconds = math.max(0, math.ceil(seconds))
@@ -1634,7 +1669,24 @@ return function(ctx)
 								if locked then
 									group.status = "Locked: " .. abilityName(locked)
 								elseif waitingOn then
+									-- While waiting on the slowest ability, use any ready ability in this group
+									-- whose cooldown ends before the slowest one does, so it's still ready when
+									-- the whole group fires and its short cooldown isn't wasted.
+									if Abil.EarlyUse then
+										for _, id in ipairs(steps) do
+											local cooldown = not NO_EARLY_USE[id] and effectiveCooldown(id, data)
+											if cooldown and cooldown + EARLY_USE_MARGIN <= longest and abilityState(id, data) == "ready" then
+												if abilityBlocker() then
+													break
+												end
+												useAbility(id)
+												group.early = (group.early or 0) + 1
+												task.wait(Abil.Gap)
+											end
+										end
+									end
 									group.status = ("Waiting on %s (%s)"):format(abilityName(waitingOn), formatLeft(longest))
+										.. ((group.early or 0) > 0 and (" · %d early use%s"):format(group.early, group.early == 1 and "" or "s") or "")
 								else
 									group.status = "Using..."
 									for i, id in ipairs(steps) do
@@ -1647,6 +1699,7 @@ return function(ctx)
 										useAbility(id)
 									end
 									group.runs += 1
+									group.early = 0
 									group.status = ("Used (%d time%s)"):format(group.runs, group.runs == 1 and "" or "s")
 									task.wait(Abil.Gap)
 								end
@@ -1727,6 +1780,16 @@ return function(ctx)
 		Tooltip = "Runs the groups below: each one waits until all of its abilities are ready, then uses them in order.",
 		Callback = function(v)
 			Abil.GroupsOn = v
+		end,
+	})
+	AbilCard:Toggle({
+		Name = "Reuse Quick Abilities While Waiting",
+		Default = true,
+		Flag = "AbilityEarlyUse",
+		Tooltip = "While a group waits on its slowest ability, its faster ones are used in the meantime, "
+			.. "but only when they'll be ready again before the group fires. Decoy and Hamburger are never used early.",
+		Callback = function(v)
+			Abil.EarlyUse = v
 		end,
 	})
 	AbilCard:Toggle({
