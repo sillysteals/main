@@ -1,1942 +1,1993 @@
 --[[
-	Egg Farm Simulator · Autofarm
-	UI: Ember (loaded from GitHub)
+	Egg Farm Simulator · Items tab (auto sell / auto open boxes), Abilities tab + Alt / Master trading
+	Loaded by the main autofarm script from GitHub (kept separate so the main
+	script stays small enough to paste into an executor). Not meant to be run on its own.
 
-	• Everything is controlled from the menu. K hides / shows it.
-	• Settings save automatically, per account (workspace/EggFarmSim/Autofarm-<UserId>.json).
-	• The Items tab (auto sell / open boxes) and Alt / Master trading are loaded from a
-	  second file on GitHub (egg_farm_trading.lua).
-	• Running the script again closes the old menu and stops the old loops.
-	• Anti-AFK is always on while the script is running.
+	Selling and box opening live here with trading so they can coordinate: a box
+	reveal hides every menu (which cancels a trade), so boxes never open during a
+	trade and trades wait for a box to finish.
+
+	Alts trade their items to the master account. Each account's role is saved per
+	UserId in workspace/EggFarmSim/accounts.json, so several accounts on one PC each
+	keep their own role, and an alt finds the master automatically once the master
+	has picked its role on the same PC.
 ]]
 
-local EMBER_URL = "https://raw.githubusercontent.com/sillysteals/main/refs/heads/main/ember.lua"
-local Ember = loadstring(game:HttpGet(EMBER_URL))()
-
-------------------------------------------------------------------
--- Services & remotes
-------------------------------------------------------------------
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
-
-local player = Players.LocalPlayer
-local Events = ReplicatedStorage:WaitForChild("Events")
-local HeroEvent = Events:WaitForChild("Heroes")
-local ProgressEvent = Events:WaitForChild("Progress")
-local WeaponEvent = Events:WaitForChild("Weapon")
-local ItemsEvent = Events:WaitForChild("Items")
-
-------------------------------------------------------------------
--- Hero data (read live from ReplicatedStorage.Settings.HeroesData)
--- Trophy IDs match the hero they belong to, so trophies use this too.
-------------------------------------------------------------------
-local Heroes = {} -- [id] = { name = "Tarzan", upgrades = 5 }
-local heroDataError
-
-do
-	local ok, result = pcall(function()
-		return require(ReplicatedStorage:WaitForChild("Settings"):WaitForChild("HeroesData"))
-	end)
-	if ok and type(result) == "table" and type(result.Stats) == "table" then
-		for id, info in pairs(result.Stats) do
-			local n = tonumber(id)
-			if n and type(info) == "table" then
-				Heroes[n] = {
-					name = type(info.Title) == "string" and info.Title or ("Hero " .. n),
-					upgrades = type(info.Upgrades) == "table" and #info.Upgrades or nil,
-				}
-			end
-		end
-	else
-		heroDataError = ok and "HeroesData had no Stats table" or tostring(result)
-		warn("[EggFarm] Couldn't read HeroesData:", heroDataError)
-	end
-end
-
-local DEFAULT_UPGRADES = 6 -- only used if a hero isn't in HeroesData
-
--- "[2] Tarzan"
-local function heroLabel(id)
-	id = tonumber(id)
-	if not id then
-		return "-"
-	end
-	return ("[%d] %s"):format(id, Heroes[id] and Heroes[id].name or "Unknown")
-end
-
--- "[2] Tarzan" -> 2
-local function idFromLabel(label)
-	return tonumber(tostring(label):match("^%[(%d+)%]"))
-end
-
--- Every hero as "[id] Name", sorted by ID
-local function heroOptions()
-	local ids = {}
-	for id in pairs(Heroes) do
-		table.insert(ids, id)
-	end
-	table.sort(ids)
-	local options = {}
-	for _, id in ipairs(ids) do
-		table.insert(options, heroLabel(id))
-	end
-	return options
-end
-
-------------------------------------------------------------------
--- Session guard (re-running replaces the old copy)
-------------------------------------------------------------------
-if _G.EggFarm and _G.EggFarm.Stop then
-	pcall(_G.EggFarm.Stop)
-end
-if _G.EggFarmRayfield then -- the old Rayfield version
-	pcall(function()
-		_G.EggFarmRayfield:Destroy()
-	end)
-	_G.EggFarmRayfield = nil
-end
-
-local session = (_G.EggFarmSession or 0) + 1
-_G.EggFarmSession = session
-
-local function alive()
-	return _G.EggFarmSession == session
-end
-
-local connections = {}
-local function track(conn)
-	table.insert(connections, conn)
-	return conn
-end
-
-------------------------------------------------------------------
--- Anti-AFK (always on while the script runs)
--- Roblox fires Idled after ~20 minutes without input; a fake right-click resets it.
-------------------------------------------------------------------
-local VirtualUser = game:GetService("VirtualUser")
-
-track(player.Idled:Connect(function()
-	VirtualUser:CaptureController()
-	VirtualUser:ClickButton2(Vector2.new())
-end))
-
-------------------------------------------------------------------
--- State (driven by the menu) & stats
-------------------------------------------------------------------
-local State = {
-	-- features
-	Diamonds = false,
-	Meat = false,
-	Grapes = false,
-	HeroFarm = false,
-	AutoAdvance = false,
-	BossFarm = false,
-	AutoReroll = false,
-
-	-- diamonds / meat / grapes
-	ReturnAfterDiamonds = true,
-	DiamondTimeout = 1.5,  -- skip a diamond that's still there after this long
-	MeatRange = 50,
-	TouchInterval = 0.25,  -- meat / grape rescan interval
-
-	-- heroes
-	SingleHero = false,
-	SingleHeroId = 2,
-
-	-- boss
-	DodgeMargin = 10, -- extra studs kept around every attack's area
-	BossHeight = 7,   -- studs above the top of the boss
-	BossReturn = false,
-
-	-- trophies
-	SavedTrophies = { ["2"] = true, ["26"] = true, ["40"] = true },
-	RerollDelay = 0.25,
-
-	-- misc
-	SwapArgs = false,
-	Debug = false,
-}
-
-local Stats = {
-	Diamonds = 0,
-	Meat = 0,
-	Grapes = 0,
-	HeroBuyAttempts = 0,
-	Attacks = 0,
-	HeroTicks = 0,
-	BatchPasses = 0,
-	Advances = 0,
-	BossFights = 0,
-	Dodges = 0,
-	BossAttacks = 0,
-	Rerolls = 0,
-}
-
-local DIAMOND_CHECK = 0.25
-local REMOTE_DELAY = 0.1
-
-local hasTouch = typeof(firetouchinterest) == "function"
-local bossActive = false -- boss farm owns the character (pauses diamonds)
-
--- Everything pauses while a trade is going on (on the alt and the master), so the
--- trade isn't disturbed. A boss fight is more important, so it never pauses and
--- the trading code doesn't start a trade during one.
-local tradingApi -- set once the Items / Alt / Master file loads
-local GUI_PAUSE_LIMIT = 120 -- stop trusting a trade window that's been up this long with no trade of ours
-local guiPauseSince
-
--- Returns true plus a short reason while farming should pause for a trade
-local function tradePaused()
-	if bossActive then
-		guiPauseSince = nil
+return function(ctx)
+	local tab = ctx.Tab
+	local alive, track, log, notify = ctx.alive, ctx.track, ctx.log, ctx.notify
+	-- true while this account is fighting the boss: no trade starts during a fight
+	local bossBusy = type(ctx.bossBusy) == "function" and ctx.bossBusy or function()
 		return false
 	end
-	-- our own trade code: the alt sending, or the master receiving
-	if tradingApi and type(tradingApi.busy) == "function" then
-		local ok, busy, why = pcall(tradingApi.busy)
-		if ok and busy == true then
-			guiPauseSince = nil
-			return true, why or "trading"
-		end
+	local idFromLabel, heroOptions = ctx.idFromLabel, ctx.heroOptions
+
+	local Players = game:GetService("Players")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local HttpService = game:GetService("HttpService")
+	local player = Players.LocalPlayer
+
+	local itemsTab = ctx.ItemsTab
+	local Events = ReplicatedStorage:FindFirstChild("Events")
+	local TradeEvent = Events and Events:WaitForChild("Trade", 5)
+	local ItemsEvent = Events and Events:FindFirstChild("Items")
+	if not TradeEvent then
+		error("ReplicatedStorage.Events.Trade wasn't found", 0)
 	end
-	-- a trade window or trade request on screen (also covers trades you do by hand)
-	local reason
-	local gui = player:FindFirstChild("PlayerGui")
-	local menus = gui and gui:FindFirstChild("Menus")
-	local trade = menus and menus:FindFirstChild("Trade")
-	if trade and trade.Visible then
-		reason = "trade window open"
-	else
-		-- the game moves its trade prompt out of Menus.Trade into Menus while it's showing
-		local prompt = menus and menus:FindFirstChild("Prompt")
-		local title = prompt and prompt:FindFirstChild("Title")
-		if prompt and prompt.Visible and title and tostring(title.Text):find("Trade") then
-			reason = "trade request showing"
-		end
+
+	local GREEN, YELLOW, RED, GREY = "#2ECC71", "#F1C40F", "#E74C3C", "#8A8D96"
+	local function esc(s)
+		return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
 	end
-	if not reason then
-		guiPauseSince = nil
-		return false
+	local function color(text, hex)
+		return ('<font color="%s">%s</font>'):format(hex, text)
 	end
-	guiPauseSince = guiPauseSince or os.clock()
-	if os.clock() - guiPauseSince > GUI_PAUSE_LIMIT then
-		return false -- something left the window up; don't stay paused forever
+	local function bold(text)
+		return "<b>" .. text .. "</b>"
 	end
-	return true, reason
-end
 
-local function log(...)
-	if State.Debug then
-		print("[EggFarm]", ...)
+	-- Opening a box plays a reveal that hides every menu, which cancels an open trade.
+	-- The box opener sets this while a box is opening; trades wait for it, and the
+	-- box opener waits for trades (see tradeActive below).
+	local boxBusyUntil = 0
+	local function boxBusy()
+		return os.clock() < boxBusyUntil
 	end
-end
+	local waitingToAccept = false -- master is holding a request until a box finishes
 
-------------------------------------------------------------------
--- Character & touch helpers
-------------------------------------------------------------------
-local function getRoot()
-	local char = player.Character
-	return char and char:FindFirstChild("HumanoidRootPart")
-end
-
-local function getPart(obj)
-	if obj:IsA("BasePart") then
-		return obj
-	end
-	if obj:IsA("Model") and obj.PrimaryPart then
-		return obj.PrimaryPart
-	end
-	return obj:FindFirstChildWhichIsA("BasePart", true)
-end
-
--- Finds the TouchTransmitter by class (in case the game renames it)
-local function getTouchPart(obj)
-	local tt = obj:FindFirstChildOfClass("TouchTransmitter") or obj:FindFirstChildWhichIsA("TouchTransmitter", true)
-	if tt and tt.Parent and tt.Parent:IsA("BasePart") then
-		return tt.Parent
-	end
-	return nil
-end
-
--- state 0 = touch begin, 1 = touch end
-local function touch(root, part, state)
-	if not hasTouch then
-		return
-	end
-	if State.SwapArgs then
-		firetouchinterest(part, root, state)
-	else
-		firetouchinterest(root, part, state)
-	end
-end
-
-local function tap(root, part)
-	touch(root, part, 0)
-	task.wait()
-	touch(root, part, 1)
-end
-
--- All touch-begins, one frame, all touch-ends (big batches go out instantly)
-local function tapBatch(root, parts)
-	for _, part in ipairs(parts) do
-		pcall(touch, root, part, 0)
-	end
-	task.wait()
-	for _, part in ipairs(parts) do
-		if part.Parent then
-			pcall(touch, root, part, 1)
-		end
-	end
-end
-
-local function placeAt(root, pos)
-	root.CFrame = CFrame.new(pos)
-	root.AssemblyLinearVelocity = Vector3.zero
-end
-
--- Only one feature moves the character at a time
-local tpBusy = false
-local function lockTeleport()
-	while tpBusy do
-		task.wait()
-	end
-	tpBusy = true
-end
-local function unlockTeleport()
-	tpBusy = false
-end
-local function withTeleport(fn)
-	lockTeleport()
-	local ok, err = pcall(fn)
-	unlockTeleport()
-	if not ok then
-		warn("[EggFarm]", err)
-	end
-end
-
-------------------------------------------------------------------
--- Farm lookup
-------------------------------------------------------------------
-local cachedFarm
-
-local function findFarm()
-	local farms = workspace:FindFirstChild("Farms")
-	if not farms then
-		return nil
-	end
-	for _, d in ipairs(farms:GetDescendants()) do
-		if d:IsA("ObjectValue") and d.Value then
-			if d.Value == player or d.Value.Name == player.Name then
-				return d.Parent
-			end
-		elseif d:IsA("StringValue") and d.Value == player.Name then
-			return d.Parent
-		end
-	end
-	return nil
-end
-
-local function getFarm(forceRefresh)
-	if not forceRefresh and cachedFarm and cachedFarm.Parent then
-		return cachedFarm
-	end
-	cachedFarm = findFarm()
-	if cachedFarm then
-		log("Found farm:", cachedFarm:GetFullName())
-	end
-	return cachedFarm
-end
-
-------------------------------------------------------------------
--- Auto Attack (your own farm's chicken)
--- The attack remote doesn't say what it hits: the server picks the nearest
--- farm chicken within 8 studs of you. So this keeps you next to your own
--- chicken and sends attacks as fast as the rate setting allows.
-------------------------------------------------------------------
-local ATTACK_KEY = "219629d5067eddcdce55ed7968e9b53f" -- sent by the game with every attack
-local ATTACK_RANGE = 8 -- the game's own reach (without the Tommy Gun)
-
-local Attack = {
-	Enabled = false,
-	Rate = 30, -- attacks per second
-	StayNear = true,
-	status = "Off",
-}
-
-local function getMyChicken()
-	local farm = getFarm()
-	local chicken = farm and farm:FindFirstChild("Chicken")
-	return chicken and chicken:IsA("BasePart") and chicken or nil
-end
-
--- A spot a few studs from the chicken, toward the farm's middle
-local function spotNearChicken(chicken)
-	local farm = chicken.Parent
-	local center = farm and farm:IsA("Model") and farm:GetPivot().Position or chicken.Position
-	local away = Vector3.new(center.X - chicken.Position.X, 0, center.Z - chicken.Position.Z)
-	away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
-	return chicken.Position + away * 4 + Vector3.new(0, 1, 0)
-end
-
-task.spawn(function()
-	local owed, last = 0, os.clock()
-	while alive() do
-		task.wait()
-		local dt = os.clock() - last
-		last = os.clock()
-
-		if not Attack.Enabled then
-			Attack.status, owed = "Off", 0
-		elseif bossActive then
-			Attack.status, owed = "Paused: boss fight", 0
-		elseif tradePaused() then
-			Attack.status, owed = "Paused: trade", 0
-		else
-			local chicken, root = getMyChicken(), getRoot()
-			if not chicken then
-				Attack.status, owed = "Waiting for your chicken", 0
-			elseif root then
-				local dist = (root.Position - chicken.Position).Magnitude
-				-- walk back over (only when nothing else is moving the character)
-				if dist > ATTACK_RANGE - 1 and Attack.StayNear and not tpBusy then
-					placeAt(root, spotNearChicken(chicken))
-					dist = (root.Position - chicken.Position).Magnitude
-				end
-				if dist <= ATTACK_RANGE then
-					Attack.status = "Attacking"
-					owed = math.min(owed + dt * Attack.Rate, Attack.Rate) -- never bank more than a second's worth
-					while owed >= 1 do
-						owed -= 1
-						WeaponEvent:FireServer("self", ATTACK_KEY)
-						Stats.Attacks += 1
-					end
-				else
-					Attack.status, owed = "Too far from your chicken", 0
-				end
-			end
-		end
-	end
-end)
-
-------------------------------------------------------------------
--- Diamonds
-------------------------------------------------------------------
-local skippedDiamonds = setmetatable({}, { __mode = "k" })
-
-local function getDiamondFolder()
-	local farm = getFarm()
-	return farm and farm:FindFirstChild("Diamonds")
-end
-
-local function countDiamonds(folder)
-	local n = 0
-	if folder then
-		for _, d in ipairs(folder:GetChildren()) do
-			if not skippedDiamonds[d] then
-				n += 1
-			end
-		end
-	end
-	return n
-end
-
-local function countSkipped()
-	local n = 0
-	for d in pairs(skippedDiamonds) do
-		if d.Parent then
-			n += 1
-		end
-	end
-	return n
-end
-
-local function collectDiamonds(folder)
-	withTeleport(function()
-		local root = getRoot()
-		if not root then
-			return
-		end
-		local original = root.CFrame
-
-		local function running()
-			return alive() and State.Diamonds and not bossActive and not tradePaused()
-		end
-
-		while running() and folder.Parent do
-			local didAny = false
-			for _, diamond in ipairs(folder:GetChildren()) do
-				if not running() then
-					break
-				end
-				if not skippedDiamonds[diamond] then
-					local part = getPart(diamond)
-					root = getRoot()
-					if part and root then
-						didAny = true
-						root.CFrame = part.CFrame
-
-						local touchPart = getTouchPart(diamond)
-						if touchPart then
-							pcall(tap, root, touchPart)
-						end
-
-						local start = os.clock()
-						repeat
-							task.wait()
-						until not diamond.Parent or os.clock() - start > State.DiamondTimeout
-
-						if diamond.Parent then
-							skippedDiamonds[diamond] = true
-							log("Diamond wouldn't collect, skipping:", diamond:GetFullName())
-						else
-							Stats.Diamonds += 1
-						end
-					end
-				end
-			end
-			if not didAny then
-				break
-			end
-		end
-
-		root = getRoot()
-		if State.ReturnAfterDiamonds and root then
-			root.CFrame = original
-		end
-	end)
-end
-
-task.spawn(function()
-	while alive() do
-		if State.Diamonds and not bossActive and not tradePaused() then
-			local folder = getDiamondFolder()
-			if countDiamonds(folder) > 0 then
-				collectDiamonds(folder)
-			end
-		end
-		task.wait(DIAMOND_CHECK)
-	end
-end)
-
-------------------------------------------------------------------
--- Meat (anything named "Meat" in workspace, within range)
-------------------------------------------------------------------
-local function inRange(root, part)
-	return (part.Position - root.Position).Magnitude <= State.MeatRange
-end
-
-local function getMeatParts(root)
-	local parts = {}
-	for _, obj in ipairs(workspace:GetChildren()) do
-		if obj.Name == "Meat" then
-			local part = getTouchPart(obj)
-			if part and inRange(root, part) then
-				table.insert(parts, part)
-			end
-		end
-	end
-	return parts
-end
-
--- Sweep
-task.spawn(function()
-	while alive() do
-		local root = getRoot()
-		if State.Meat and root and not tradePaused() then
-			local parts = getMeatParts(root)
-			if #parts > 0 then
-				log(("Meat: touching %d"):format(#parts))
-				tapBatch(root, parts)
-				Stats.Meat += #parts
-			end
-		end
-		task.wait(State.TouchInterval)
-	end
-end)
-
--- Instant: grab new meat the moment it spawns
-track(workspace.ChildAdded:Connect(function(obj)
-	if obj.Name ~= "Meat" or not (alive() and State.Meat) or tradePaused() then
-		return
-	end
-	task.spawn(function()
-		-- the TouchTransmitter can replicate a moment after the item itself
-		local part
-		local start = os.clock()
-		repeat
-			part = getTouchPart(obj)
-			if part then
-				break
-			end
-			task.wait(0.1)
-		until not obj.Parent or os.clock() - start > 3
-
-		local root = getRoot()
-		if not (alive() and State.Meat and part and part.Parent and root and inRange(root, part)) or tradePaused() then
-			return
-		end
-		log("Meat: new item, touching", part:GetFullName())
-		pcall(tap, root, part)
-		Stats.Meat += 1
-	end)
-end))
-
-------------------------------------------------------------------
--- Grapes (every TouchTransmitter under Alien.Moon.Grapes)
-------------------------------------------------------------------
-local grapeTransmitters = 0
-
-local function getGrapesFolder()
-	local alien = workspace:FindFirstChild("Alien")
-	local moon = alien and alien:FindFirstChild("Moon")
-	return moon and moon:FindFirstChild("Grapes")
-end
-
--- One grape, in its own thread so every grape fires in parallel
-local function fireGrape(tt)
-	local part = tt.Parent
-	local root = getRoot()
-	if not (root and part and part:IsA("BasePart")) then
-		return
-	end
-	local ok, err = pcall(tap, root, part)
-	if ok then
-		Stats.Grapes += 1
-	else
-		warn("[EggFarm] Grape fire failed:", err)
-	end
-end
-
--- Sweep
-task.spawn(function()
-	while alive() do
-		local folder = getGrapesFolder()
-		local count = 0
-		if folder then
-			for _, d in ipairs(folder:GetDescendants()) do
-				if d:IsA("TouchTransmitter") then
-					count += 1
-					if State.Grapes and not tradePaused() then
-						task.spawn(fireGrape, d)
-					end
-				end
-			end
-		end
-		grapeTransmitters = count
-		if State.Grapes then
-			log(("Grapes: fired %d"):format(count))
-		end
-		task.wait(State.TouchInterval)
-	end
-end)
-
--- Instant: fire new transmitters as they appear (re-hooks if the folder is replaced)
-task.spawn(function()
-	local hooked, conn
-	while alive() do
-		local folder = getGrapesFolder()
-		if folder ~= hooked then
-			if conn then
-				conn:Disconnect()
-			end
-			conn, hooked = nil, folder
-			if folder then
-				conn = folder.DescendantAdded:Connect(function(d)
-					if alive() and State.Grapes and d:IsA("TouchTransmitter") and not tradePaused() then
-						task.defer(fireGrape, d)
-					end
-				end)
-				log("Grapes: watching", folder:GetFullName())
-			end
-		end
-		task.wait(1)
-	end
-	if conn then
-		conn:Disconnect()
-	end
-end)
-
-------------------------------------------------------------------
--- Heroes
-------------------------------------------------------------------
-local function getHeroFolder()
-	local farm = getFarm()
-	return farm and (farm:FindFirstChild("Heroes") or farm:FindFirstChild("Heros"))
-end
-
-local function getOwnedHeroIds()
-	local ids = {}
-	local folder = getHeroFolder()
-	if folder then
-		for _, hero in ipairs(folder:GetChildren()) do
-			local id = tonumber(hero.Name)
-			if id then
-				table.insert(ids, id)
-			end
-		end
-	end
-	table.sort(ids)
-	return ids
-end
-
--- Buying a hero is done by training it
-local function buyNextHero()
-	if not getFarm() then
-		return
-	end
-	local owned = getOwnedHeroIds()
-	local nextId = (owned[#owned] or 0) + 1
-	log("Trying to buy hero", nextId)
-	pcall(function()
-		HeroEvent:FireServer("Train", tostring(nextId), nil, "MAX")
-	end)
-	Stats.HeroBuyAttempts += 1
-end
-
--- Train MAX + every upgrade this hero actually has
-local function maxUpgradeHero(id)
-	local idStr = tostring(id)
-	pcall(function()
-		HeroEvent:FireServer("Train", idStr, nil, "MAX")
-	end)
-	task.wait(REMOTE_DELAY)
-	local hero = Heroes[tonumber(id)]
-	for upgrade = 1, (hero and hero.upgrades) or DEFAULT_UPGRADES do
-		pcall(function()
-			HeroEvent:FireServer("Upgrade", idStr, upgrade)
+	-- Requires a game module, but gives up after `timeout` so it can never freeze loading
+	local function requireWithin(folderName, moduleName, timeout)
+		local job = { done = false }
+		task.spawn(function()
+			local ok, result = pcall(function()
+				local folder = ReplicatedStorage:FindFirstChild(folderName)
+				local module = folder and folder:FindFirstChild(moduleName)
+				return module and require(module)
+			end)
+			job.value = ok and result or nil
+			job.done = true
 		end)
-		task.wait(REMOTE_DELAY)
-	end
-end
-
-local function upgradeList(ids, force)
-	for _, id in ipairs(ids) do
-		if not (alive() and (force or (State.HeroFarm and not tradePaused()))) then
-			return
+		local start = os.clock()
+		while not job.done and os.clock() - start < timeout do
+			task.wait()
 		end
-		maxUpgradeHero(id)
-	end
-end
-
--- Best N heroes, best -> worst
-local function getBestHeroes(owned, n)
-	local list = {}
-	for i = #owned, math.max(1, #owned - n + 1), -1 do
-		table.insert(list, owned[i])
-	end
-	return list
-end
-
--- Rotating batches from the worst hero up, wrapping around. Each batch runs best -> worst.
-local HERO_TICK_INTERVAL = 5 -- seconds between ticks
-local HERO_BEST_COUNT = 3    -- best N heroes upgraded every tick
-local HERO_BATCH_SIZE = 5    -- heroes per rotating batch
-local HERO_BATCH_EVERY = 3   -- run the next batch every Nth tick
-local HERO_BUY_EVERY = 2     -- try to buy the next hero every Nth tick
-
-local batchIndex = 0
-
-local function getBatchRange(owned)
-	local size = HERO_BATCH_SIZE
-	if batchIndex * size >= #owned then
-		batchIndex = 0
-	end
-	local first = batchIndex * size + 1
-	return first, math.min(first + size - 1, #owned)
-end
-
-local function getNextBatch(owned)
-	local first, last = getBatchRange(owned)
-	local list = {}
-	for i = last, first, -1 do
-		table.insert(list, owned[i])
-	end
-	return list
-end
-
-local heroTick = 0
-local heroNextTick = 0 -- reset to 0 when the toggle turns on so it starts right away
-
-local function heroFarmTick(force)
-	if not getFarm() then
-		return
-	end
-	heroTick += 1
-	Stats.HeroTicks += 1
-
-	-- buy first so the new hero is included below
-	if heroTick % HERO_BUY_EVERY == 0 then
-		buyNextHero()
-		task.wait(REMOTE_DELAY)
+		return job.value
 	end
 
-	if State.SingleHero then
-		upgradeList({ State.SingleHeroId }, force)
-		return
+	local ItemsFolder = ReplicatedStorage:FindFirstChild("Items")
+	local BoxData = requireWithin("Settings", "BoxData", 3)
+	if type(BoxData) ~= "table" then
+		BoxData = nil
 	end
 
-	local owned = getOwnedHeroIds()
-	upgradeList(getBestHeroes(owned, HERO_BEST_COUNT), force)
-
-	if heroTick % HERO_BATCH_EVERY == 0 and #owned > 0 then
-		local batch = getNextBatch(owned)
-		log("Batch", batchIndex + 1, "->", table.concat(batch, ", "))
-		upgradeList(batch, force)
-		batchIndex += 1
-		Stats.BatchPasses += 1
-	end
-end
-
-task.spawn(function()
-	while alive() do
-		if State.HeroFarm and os.clock() >= heroNextTick and not tradePaused() then
-			heroNextTick = os.clock() + HERO_TICK_INTERVAL
-			heroFarmTick(false)
-		end
-		task.wait(0.25)
-	end
-end)
-
-------------------------------------------------------------------
--- Auto Advance
-------------------------------------------------------------------
--- Key the game sends with the "Next Level" call (captured with Cobalt)
-local ADVANCE_KEY = "\xE5\x9B\x9E\xE5\xB0\x8F\xE4\xBD\x8F\xE4\xBD\x8D\xE5\xA6\xBB\xE5\x9B\x9E\xE5\xB9\xB3\xE5\xA6\xBB\xE8\xA6\x81\xE6\x8A\x84\xE3\x81\x8B\xE4\xBD\x8F\xE3\x83\x8B\xE3\x81\x8C\xE5\xB9\xB3\xE3\x82\x82\xE5\xB0\x8F\xE3\x83\x8D\xE3\x83\x8D\xE5\x9B\x9E\xE3\x83\x8D\xE6\x8A\x84\xE6\xBF\x80\xE3\x81\xA6\xE3\x82\x82"
-
-local function getProgressLabel()
-	local gui = player:FindFirstChild("PlayerGui")
-	local screen = gui and gui:FindFirstChild("Progress")
-	return screen and screen:FindFirstChild("Progress")
-end
-
--- current, needed from text like "6 / 10" (commas allowed)
-local function getProgress()
-	local label = getProgressLabel()
-	if not label then
-		return nil
-	end
-	local text = label.Text:gsub(",", "")
-	local current, needed = text:match("(%d+)%s*/%s*(%d+)")
-	return tonumber(current), tonumber(needed)
-end
-
-local function advance()
-	local ok, err = pcall(function()
-		ProgressEvent:FireServer(ADVANCE_KEY, "Next Level")
-	end)
-	if ok then
-		Stats.Advances += 1
-		log("Advanced to next level")
-	else
-		warn("[EggFarm] Advance failed:", err)
-	end
-end
-
-local function readyToAdvance()
-	local current, needed = getProgress()
-	return current ~= nil and needed ~= nil and needed > 0 and current >= needed
-end
-
--- Advances the moment the bar is full, then waits for the label to change
--- (or 2s) so the same level is never sent twice.
-local advancing = false
-local function tryAdvance()
-	if advancing or not (alive() and State.AutoAdvance) or tradePaused() or not readyToAdvance() then
-		return
-	end
-	advancing = true
-	local label = getProgressLabel()
-	local before = label and label.Text
-	advance()
-	local start = os.clock()
-	while alive() and label and label.Parent and label.Text == before and os.clock() - start < 2 do
-		task.wait()
-	end
-	advancing = false
-end
-
--- Reacts instantly to the progress label changing, with a fast poll as a fallback
-task.spawn(function()
-	local hooked, conn
-	while alive() do
-		local label = getProgressLabel()
-		if label ~= hooked then
-			if conn then
-				conn:Disconnect()
-			end
-			conn, hooked = nil, label
-			if label then
-				conn = label:GetPropertyChangedSignal("Text"):Connect(function()
-					task.spawn(tryAdvance)
+	-- Your live inventory (the same data the game's inventory menu reads).
+	-- Only loaded the first time something is sold, so it can't slow down startup.
+	local dataJob
+	local function getData()
+		if not dataJob then
+			dataJob = { done = false }
+			task.spawn(function()
+				local ok, result = pcall(function()
+					local folder = ReplicatedStorage:WaitForChild("Modules", 10)
+					local module = folder and folder:WaitForChild("DataHandler", 10)
+					if not module then
+						error("ReplicatedStorage.Modules.DataHandler wasn't found", 0)
+					end
+					return require(module)
 				end)
-			end
-		end
-		tryAdvance()
-		task.wait(0.25)
-	end
-	if conn then
-		conn:Disconnect()
-	end
-end)
-
-------------------------------------------------------------------
--- Boss Farm
-------------------------------------------------------------------
-local HAZARD_NAMES = { CandyCorn = true, Target = true }
-local BOSS_TICK = 0.05           -- fight loop / attack rate
-local DODGE_SEARCH_RADIUS = 80   -- how far to look for a safe spot
-local WAIT_FOR_BOSS_TIMEOUT = 60 -- give up waiting at the rocket after this
-
-local Boss = {
-	phase = "Idle", -- Idle / Waiting / Fighting
-	countdown = nil,
-	dodging = false,
-	hazardCount = 0,
-}
-
-local function getAlien()
-	return workspace:FindFirstChild("Alien")
-end
-
-local function getRocketCircle()
-	local alien = getAlien()
-	local rocket = alien and alien:FindFirstChild("Rocket")
-	return rocket and rocket:FindFirstChild("Circle")
-end
-
-local function getCountdownLabel()
-	local circle = getRocketCircle()
-	local info = circle and circle:FindFirstChild("InfoGui")
-	local wrapper = info and info:FindFirstChild("Wrapper")
-	return wrapper and wrapper:FindFirstChild("Title")
-end
-
-local function getBossChicken()
-	local alien = getAlien()
-	return alien and alien:FindFirstChild("Chicken")
-end
-
--- Handles "15", "Launching in 15s", "0:15", "1,000"
-local function getCountdown()
-	local label = getCountdownLabel()
-	if not label then
-		return nil
-	end
-	local text = label.Text:gsub(",", "")
-	local m, s = text:match("(%d+):(%d+)")
-	if m then
-		return (tonumber(m) or 0) * 60 + (tonumber(s) or 0)
-	end
-	return tonumber(text:match("%d+%.?%d*"))
-end
-
----------------- hazards (every CandyCorn / Target under Terrain) ----------------
-local hazards = {}
-
-local function trackHazard(obj)
-	if HAZARD_NAMES[obj.Name] then
-		hazards[obj] = true
-	end
-end
-
-for _, child in ipairs(workspace.Terrain:GetChildren()) do
-	trackHazard(child)
-end
-track(workspace.Terrain.ChildAdded:Connect(trackHazard))
-track(workspace.Terrain.ChildRemoved:Connect(function(obj)
-	hazards[obj] = nil
-end))
-
--- Expands an XZ box to cover a (possibly rotated) part
-local function addPartBounds(part, b)
-	local cf, size = part.CFrame, part.Size
-	local r, u, l = cf.RightVector, cf.UpVector, cf.LookVector
-	local hx, hy, hz = size.X / 2, size.Y / 2, size.Z / 2
-	local ex = math.abs(r.X) * hx + math.abs(u.X) * hy + math.abs(l.X) * hz
-	local ez = math.abs(r.Z) * hx + math.abs(u.Z) * hy + math.abs(l.Z) * hz
-	local p = cf.Position
-	b.minX = math.min(b.minX, p.X - ex)
-	b.maxX = math.max(b.maxX, p.X + ex)
-	b.minZ = math.min(b.minZ, p.Z - ez)
-	b.maxZ = math.max(b.maxZ, p.Z + ez)
-end
-
--- XZ area an attack covers (Y ignored). Works for a Part, Model or Folder.
-local function getXZBounds(obj)
-	local b = { minX = math.huge, maxX = -math.huge, minZ = math.huge, maxZ = -math.huge }
-	if obj:IsA("BasePart") then
-		addPartBounds(obj, b)
-	end
-	for _, d in ipairs(obj:GetDescendants()) do
-		if d:IsA("BasePart") then
-			addPartBounds(d, b)
-		end
-	end
-	if b.minX == math.huge then
-		return nil
-	end
-	return b
-end
-
--- Current areas of every live attack (moving / growing attacks are re-measured each tick)
-local function snapshotHazards()
-	for _, child in ipairs(workspace.Terrain:GetChildren()) do
-		trackHazard(child) -- anything renamed after spawning
-	end
-	local list = {}
-	for obj in pairs(hazards) do
-		if not obj.Parent then
-			hazards[obj] = nil
-		else
-			local b = getXZBounds(obj)
-			if b then
-				table.insert(list, b)
-			end
-		end
-	end
-	return list
-end
-
-local function inDanger(pos, list, margin)
-	for _, b in ipairs(list) do
-		if pos.X >= b.minX - margin and pos.X <= b.maxX + margin and pos.Z >= b.minZ - margin and pos.Z <= b.maxZ + margin then
-			return true
-		end
-	end
-	return false
-end
-
--- Nearest safe spot around `center`; keeps the current one while it's still safe
-local function findSafeSpot(center, list, margin, current, playerPos)
-	if current and not inDanger(current, list, margin) then
-		return current
-	end
-	local searchMargin = margin + 2 -- don't sit right on the edge
-	for radius = 6, DODGE_SEARCH_RADIUS, 4 do
-		local steps = math.max(12, math.floor(radius))
-		local best, bestDist
-		for i = 0, steps - 1 do
-			local a = (i / steps) * math.pi * 2
-			local p = center + Vector3.new(math.cos(a) * radius, 0, math.sin(a) * radius)
-			if not inDanger(p, list, searchMargin) then
-				local d = (p - playerPos).Magnitude
-				if not bestDist or d < bestDist then
-					best, bestDist = p, d
+				if ok and type(result) == "table" and type(result.Get) == "function" then
+					dataJob.value = result
+				else
+					dataJob.err = ok and "DataHandler has no Get function" or tostring(result)
 				end
+				dataJob.done = true
+			end)
+			local start = os.clock()
+			while not dataJob.done and os.clock() - start < 5 do
+				task.wait()
+			end
+		end
+		if not dataJob.value then
+			return nil, dataJob.done and ("Couldn't read your inventory: " .. tostring(dataJob.err)) or "Still loading your inventory..."
+		end
+		local ok, data = pcall(dataJob.value.Get, "data")
+		if not ok or type(data) ~= "table" or type(data.inventory) ~= "table" then
+			return nil, "Couldn't read your inventory"
+		end
+		return data
+	end
+
+	---------------- accounts file ----------------
+	local ACCOUNTS_FILE = "EggFarmSim/accounts.json"
+	local ROLES = { Off = true, Alt = true, Master = true }
+	local myKey = tostring(player.UserId)
+
+	-- Always returns { accounts = { [userId] = { name, role, master?, updated } } },
+	-- dropping anything malformed so the rest of the script can trust the shape.
+	local function readAccounts()
+		local data
+		pcall(function()
+			if isfile(ACCOUNTS_FILE) then
+				data = HttpService:JSONDecode(readfile(ACCOUNTS_FILE))
+			end
+		end)
+		if type(data) ~= "table" then
+			data = {}
+		end
+		if type(data.accounts) ~= "table" then
+			data.accounts = {}
+		end
+		for key, entry in pairs(data.accounts) do
+			if type(entry) ~= "table" or type(entry.name) ~= "string" or not ROLES[entry.role] then
+				data.accounts[key] = nil
+			end
+		end
+		return data
+	end
+
+	local function writeAccounts(data)
+		return (pcall(function()
+			if not isfolder("EggFarmSim") then
+				makefolder("EggFarmSim")
+			end
+			writefile(ACCOUNTS_FILE, HttpService:JSONEncode(data))
+		end))
+	end
+
+	-- Re-reads before writing so another account's change in the meantime isn't lost
+	local function updateMyAccount(changes)
+		local data = readAccounts()
+		local me = data.accounts[myKey] or { role = "Off" }
+		for k, v in pairs(changes) do
+			me[k] = v
+		end
+		me.name = player.Name
+		me.updated = os.time()
+		data.accounts[myKey] = me
+		return writeAccounts(data)
+	end
+
+	local function myAccount()
+		return readAccounts().accounts[myKey]
+	end
+
+	local currentRole = (myAccount() or {}).role or "Off"
+
+	-- Master to send to: this account's own override, otherwise the account
+	-- most recently set as Master on this PC
+	local function getMasterName()
+		local data = readAccounts()
+		local me = data.accounts[myKey]
+		if me and type(me.master) == "string" and me.master ~= "" then
+			return me.master, "typed in"
+		end
+		local best
+		for key, entry in pairs(data.accounts) do
+			if key ~= myKey and entry.role == "Master" and (not best or (entry.updated or 0) > (best.updated or 0)) then
+				best = entry
 			end
 		end
 		if best then
-			return best
+			return best.name, "this PC"
 		end
-	end
-	return nil
-end
-
--- BossHeight studs above the top of the boss
-local function getBossAttackPos(boss)
-	local cf, size
-	if boss:IsA("BasePart") then
-		cf, size = boss.CFrame, boss.Size
-	elseif boss:IsA("Model") then
-		cf, size = boss:GetBoundingBox()
-	else
-		local p = boss:FindFirstChildWhichIsA("BasePart", true)
-		if not p then
-			return nil
-		end
-		cf, size = p.CFrame, p.Size
-	end
-	return cf.Position + Vector3.new(0, size.Y / 2 + State.BossHeight, 0)
-end
-
----------------- fight ----------------
-local function fightBoss()
-	Boss.phase = "Fighting"
-	Stats.BossFights += 1
-	log("Boss fight started")
-
-	local safeSpot
-	while alive() and State.BossFarm do
-		local boss = getBossChicken()
-		if not boss then
-			break
-		end
-
-		local root = getRoot()
-		local attackPos = getBossAttackPos(boss)
-		if root and attackPos then
-			local list = snapshotHazards()
-			Boss.hazardCount = #list
-
-			if inDanger(attackPos, list, State.DodgeMargin) then
-				-- dodge always wins: hold a safe spot until the attack spot clears
-				if not Boss.dodging then
-					Boss.dodging = true
-					Stats.Dodges += 1
-					log("Dodging")
-				end
-				safeSpot = findSafeSpot(attackPos, list, State.DodgeMargin, safeSpot, root.Position)
-				if safeSpot then
-					placeAt(root, safeSpot)
-				end
-			else
-				if Boss.dodging then
-					Boss.dodging = false
-					safeSpot = nil
-					log("Clear, back to attacking")
-				end
-				placeAt(root, attackPos)
-				pcall(function()
-					WeaponEvent:FireServer("alien", ATTACK_KEY)
-				end)
-				Stats.BossAttacks += 1
-			end
-		end
-		task.wait(BOSS_TICK)
-	end
-
-	Boss.dodging = false
-	Boss.hazardCount = 0
-	log("Boss fight over")
-end
-
----------------- full cycle: rocket -> wait -> fight ----------------
-local function teleportToRocket()
-	local circle = getRocketCircle()
-	local part = circle and getPart(circle)
-	local root = getRoot()
-	if not (part and root) then
 		return nil
 	end
-	local target = part.Position + Vector3.new(0, 3, 0)
-	placeAt(root, target)
-	return target
-end
 
-local function runBossCycle()
-	bossActive = true
-	lockTeleport() -- waits for anything mid-teleport (e.g. diamonds) to finish
-
-	local root = getRoot()
-	local startCFrame = root and root.CFrame
-
-	local ok, err = pcall(function()
-		if not getBossChicken() then
-			Boss.phase = "Waiting"
-			local target = teleportToRocket()
-			if target then
-				log("Teleported to rocket")
-				local start = os.clock()
-				while alive() and State.BossFarm and not getBossChicken() and os.clock() - start < WAIT_FOR_BOSS_TIMEOUT do
-					-- stay on the pad during the final countdown
-					local v = getCountdown()
-					root = getRoot()
-					if root and v and v > 1 and v <= 10 and (root.Position - target).Magnitude > 8 then
-						placeAt(root, target)
-					end
-					task.wait(0.25)
-				end
+	local function knownAlts()
+		local names = {}
+		for key, entry in pairs(readAccounts().accounts) do
+			if key ~= myKey and entry.role == "Alt" then
+				table.insert(names, entry.name)
 			end
 		end
-
-		if alive() and State.BossFarm and getBossChicken() then
-			fightBoss()
-		end
-	end)
-	if not ok then
-		warn("[EggFarm] Boss error:", err)
+		table.sort(names)
+		return names
 	end
 
-	root = getRoot()
-	if State.BossReturn and root and startCFrame then
-		root.CFrame = startCFrame
-	end
-
-	Boss.phase = "Idle"
-	unlockTeleport()
-	bossActive = false
-end
-
----------------- countdown watcher ----------------
-task.spawn(function()
-	local lastValue, armed = nil, false
-	while alive() do
-		local value = getCountdown()
-		Boss.countdown = value
-
-		-- arm only while it's really counting down between 10 and 120
-		if value and value ~= lastValue then
-			if lastValue and value < lastValue and value > 10 and value < 120 then
-				armed = true
-			elseif lastValue and value > lastValue then
-				armed = false -- reset / cooldown started
-			end
-			lastValue = value
-		end
-
-		if State.BossFarm and armed and value ~= nil and value <= 10 then
-			armed = false
-			runBossCycle()
-			lastValue = nil
-		end
-
-		task.wait(BOSS_TICK)
-	end
-end)
-
-------------------------------------------------------------------
--- Trophy Auto Reroll
-------------------------------------------------------------------
-local function getTrophyList()
-	local gui = player:FindFirstChild("PlayerGui")
-	local menus = gui and gui:FindFirstChild("Menus")
-	local inv = menus and menus:FindFirstChild("Inventory")
-	return inv and inv:FindFirstChild("List")
-end
-
--- "02" / " 2 " / 2 -> "2"
-local function normId(v)
-	local n = tonumber(tostring(v):match("%d+"))
-	return n and tostring(n) or nil
-end
-
--- {"[2] Tarzan", "[26] Aang"} -> { ["2"] = true, ["26"] = true }
-local function savedFromLabels(labels)
-	local saved = {}
-	for _, label in ipairs(labels or {}) do
-		local id = idFromLabel(label)
-		if id then
-			saved[tostring(id)] = true
-		end
-	end
-	return saved
-end
-
--- Every trophy we own (one per TextButton, duplicates included)
-local function getOwnedTrophies()
-	local ids = {}
-	local list = getTrophyList()
-	if list then
-		for _, child in ipairs(list:GetChildren()) do
-			if child:IsA("TextButton") then
-				local id = normId(child.Name)
-				if id then
-					table.insert(ids, id)
-				end
+	local function findPlayer(name)
+		local lower = string.lower(tostring(name))
+		for _, p in ipairs(Players:GetPlayers()) do
+			if string.lower(p.Name) == lower then
+				return p
 			end
 		end
-	end
-	return ids
-end
-
-local function isSaved(id)
-	return State.SavedTrophies[id] == true
-end
-
--- One pass: reroll every trophy that isn't saved
-local function rerollPass(force)
-	local count = 0
-	for _, id in ipairs(getOwnedTrophies()) do
-		if not (alive() and (force or (State.AutoReroll and not tradePaused()))) then
-			break
-		end
-		if not isSaved(id) then
-			pcall(function()
-				ItemsEvent:FireServer("Reforge1", id)
-			end)
-			Stats.Rerolls += 1
-			count += 1
-			log("Rerolled trophy", id)
-			task.wait(State.RerollDelay)
-		end
-	end
-	return count
-end
-
-task.spawn(function()
-	while alive() do
-		if State.AutoReroll and not tradePaused() then
-			-- rescans each pass, so trophies that rolled into a saved ID are left alone
-			if rerollPass(false) == 0 then
-				task.wait(1)
-			end
-		end
-		task.wait(0.1)
-	end
-end)
-
-------------------------------------------------------------------
--- Status text (shared by the Status tab and the per-feature cards)
-------------------------------------------------------------------
-local GREEN, YELLOW, RED, GREY = "#2ECC71", "#F1C40F", "#E74C3C", "#8A8D96"
-
-local function esc(s)
-	return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
-end
-local function color(text, hex)
-	return ('<font color="%s">%s</font>'):format(hex, text)
-end
-local function bold(text)
-	return "<b>" .. text .. "</b>"
-end
-
-local function farmText()
-	local farm = getFarm()
-	local lines = {}
-	if farm then
-		table.insert(lines, bold("Farm: ") .. color("Found", GREEN) .. " (" .. esc(farm.Name) .. ")")
-		table.insert(lines, bold("Diamonds waiting: ") .. countDiamonds(farm:FindFirstChild("Diamonds")))
-	else
-		table.insert(lines, bold("Farm: ") .. color("Not found", RED) .. " — use Re-find My Farm")
-	end
-	table.insert(lines, bold("Grape transmitters: ") .. grapeTransmitters)
-	local paused, why = tradePaused()
-	if paused then
-		table.insert(lines, color("Paused for trade: " .. esc(why or "?"), YELLOW))
-	end
-	if not hasTouch then
-		table.insert(lines, color("firetouchinterest isn't supported by this executor", RED))
-	end
-	return table.concat(lines, "\n")
-end
-
-local function progressText()
-	local current, needed = getProgress()
-	local chickens
-	if current and needed then
-		chickens = ("%d / %d"):format(current, needed) .. (current >= needed and "  " .. color("ready!", GREEN) or "")
-	else
-		chickens = color("label not found", GREY)
-	end
-	return bold("Chickens: ") .. chickens .. "\n" .. bold("Levels advanced: ") .. Stats.Advances
-end
-
-local function bossText()
-	local phaseColor = Boss.phase == "Fighting" and RED or Boss.phase == "Waiting" and YELLOW or GREY
-	return table.concat({
-		bold("Phase: ") .. color(Boss.phase, phaseColor) .. (Boss.dodging and "  " .. color("DODGING", YELLOW) or ""),
-		bold("Countdown: ") .. (Boss.countdown and tostring(Boss.countdown) or "-"),
-		bold("Active attacks: ") .. Boss.hazardCount,
-		("Fights %d · Dodges %d · Hits %d"):format(Stats.BossFights, Stats.Dodges, Stats.BossAttacks),
-	}, "\n")
-end
-
-local function heroText()
-	local owned = getOwnedHeroIds()
-	local highest = owned[#owned]
-	local nextId = (highest or 0) + 1
-
-	local mode
-	if State.SingleHero then
-		mode = "Only " .. esc(heroLabel(State.SingleHeroId))
-	else
-		mode = ("Best %d + batches"):format(HERO_BEST_COUNT)
+		return nil
 	end
 
-	local lines = {
-		bold("Owned: ") .. #owned .. "   " .. bold("Tick: ") .. heroTick,
-		bold("Best: ") .. (highest and esc(heroLabel(highest)) or "none"),
-		bold("Next to buy: ") .. (Heroes[nextId] and esc(heroLabel(nextId)) or color("all bought", GREEN)),
-		bold("Mode: ") .. mode,
+	---------------- settings (driven by the menu) ----------------
+	local CATEGORIES = { "Boxes", "Weapons", "Wings", "Trails", "Trophies" }
+	local MAX_SLOTS = 4 -- slots per trade
+
+	local TradeSettings = {
+		AutoSend = false,
+		Types = { Boxes = true },
+		Filter = {}, -- [category] = set of allowed keys; empty = everything
+		Stacks = false,
+		Diamonds = false,
+		KeepDiamonds = 0,
+		AutoAccept = false,
+		AcceptAnyone = false,
+		ExtraAlts = {}, -- lowercased names
 	}
-	if not State.SingleHero and #owned > 0 then
-		local first, last = getBatchRange(owned)
-		table.insert(lines, bold("Next batch: ") .. esc(heroLabel(owned[first])) .. " to " .. esc(heroLabel(owned[last])))
-	end
-	return table.concat(lines, "\n")
-end
 
-local function trophyText()
-	local trophies = getOwnedTrophies()
-	local savedCount, unsaved, seen, savedIds = 0, 0, {}, {}
-	for _, id in ipairs(trophies) do
-		if isSaved(id) then
-			savedCount += 1
-			if not seen[id] then
-				seen[id] = true
-				table.insert(savedIds, tonumber(id))
-			end
-		else
-			unsaved += 1
+	---------------- building an offer ----------------
+	-- Tier the game attaches to each slot (same rules as its trade menu)
+	local function tierOf(cat, key, value)
+		if cat == "Boxes" then
+			return value
+		elseif cat == "Trophies" then
+			return 7
 		end
+		local folder = ItemsFolder and ItemsFolder:FindFirstChild(cat)
+		local item = folder and folder:FindFirstChild(cat == "Weapons" and tostring(value[1]) or tostring(key))
+		local tier = item and item:FindFirstChild("Tier")
+		return tier and tier.Value or 1
 	end
-	table.sort(savedIds)
-	local names = {}
-	for _, id in ipairs(savedIds) do
-		table.insert(names, esc(heroLabel(id)))
+
+	-- What the per-category filters compare against
+	local function filterKey(cat, key, value)
+		if cat == "Boxes" then
+			return tostring(value) -- box tier
+		elseif cat == "Weapons" then
+			return type(value) == "table" and tostring(value[1]) or nil -- weapon name
+		end
+		return tostring(key) -- wing / trail name, trophy hero ID
 	end
-	return table.concat({
-		bold("Owned: ") .. #trophies .. "   " .. bold("To reroll: ") .. unsaved,
-		bold("Saved owned: ") .. savedCount .. (#names > 0 and "\n" .. table.concat(names, ", ") or ""),
-		bold("Rerolls sent: ") .. Stats.Rerolls,
-	}, "\n")
-end
 
--- Roblox doesn't let clients see how long a server has been up (DistributedGameTime
--- only counts from when you joined, despite its name), so this shows your time in it.
-local function serverText()
-	local seconds = math.max(0, math.floor(workspace.DistributedGameTime))
-	local h, m, s = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60
-	return table.concat({
-		bold("In this server: ") .. ("%dh %02dm %02ds"):format(h, m, s),
-		bold("Players: ") .. #Players:GetPlayers() .. " / " .. Players.MaxPlayers,
-	}, "\n")
-end
-
-local function sessionText()
-	return table.concat({
-		bold("Diamonds: ") .. Stats.Diamonds .. "   " .. bold("Skipped: ") .. countSkipped(),
-		bold("Meat touches: ") .. Stats.Meat,
-		bold("Grape touches: ") .. Stats.Grapes,
-		bold("Hero ticks: ") .. Stats.HeroTicks .. "   " .. bold("Batches: ") .. Stats.BatchPasses,
-		bold("Hero buy attempts: ") .. Stats.HeroBuyAttempts,
-	}, "\n")
-end
-
-------------------------------------------------------------------
--- Menu
-------------------------------------------------------------------
-local Window
-
-local stopped = false
-local function stop()
-	if stopped then
-		return
+	local function allowed(cat, key, value)
+		local set = TradeSettings.Filter[cat]
+		if not set or next(set) == nil then
+			return true
+		end
+		local k = filterKey(cat, key, value)
+		return k ~= nil and set[k] == true
 	end
-	stopped = true
-	if _G.EggFarmSession == session then
-		_G.EggFarmSession = session + 1 -- stops every loop
+
+	local function sortedKeys(t)
+		local keys = {}
+		for key in pairs(t) do
+			table.insert(keys, key)
+		end
+		table.sort(keys, function(a, b)
+			if type(a) == "number" and type(b) == "number" then
+				return a < b
+			end
+			return tostring(a) < tostring(b)
+		end)
+		return keys
 	end
-	for _, c in ipairs(connections) do
+
+	-- Up to 4 slots in the game's trade format: { category, key, value, tier, count = n }
+	-- Returns giving, diamonds, itemCount, errorMessage
+	local function buildOffer()
+		local data, dataErr = getData()
+		if not data or type(data.inventory) ~= "table" then
+			return nil, 0, 0, dataErr or "Couldn't read your inventory"
+		end
+
+		local giving, slots, items = {}, 0, 0
+		local function add(cat, key, value, count)
+			slots += 1
+			giving[tostring(slots)] = { cat, key, value, tierOf(cat, key, value), count = count }
+			items += count
+		end
+
+		for _, cat in ipairs(CATEGORIES) do
+			if slots >= MAX_SLOTS then
+				break
+			end
+			local inv = data.inventory[string.lower(cat)]
+			local equipped = type(data.using) == "table" and data.using[string.lower(cat)] or nil
+			if TradeSettings.Types[cat] and type(inv) == "table" then
+				for _, key in ipairs(sortedKeys(inv)) do
+					if slots >= MAX_SLOTS then
+						break
+					end
+					local value = inv[key]
+					local isEquipped = equipped ~= nil and tostring(key) == tostring(equipped)
+					if not isEquipped and allowed(cat, key, value) then
+						if cat == "Boxes" then
+							add(cat, key, value, 1) -- every box is its own entry
+						else
+							local owned
+							if cat == "Weapons" then
+								owned = type(value) == "table" and (tonumber(value[3]) or 1) or 0
+							else
+								owned = tonumber(value) or 0
+							end
+							if owned > 0 then
+								if TradeSettings.Stacks then
+									add(cat, key, value, owned)
+								else
+									for _ = 1, math.min(owned, MAX_SLOTS - slots) do
+										add(cat, key, value, 1)
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+
+		local diamonds = 0
+		if TradeSettings.Diamonds then
+			local have = tonumber(data.diamonds) or 0
+			diamonds = math.min(math.floor(math.max(0, have - TradeSettings.KeepDiamonds)), 999999999999)
+		end
+		return giving, diamonds, items, nil
+	end
+
+	local function countSlots(slots)
+		local n = 0
+		for _, slot in pairs(slots or {}) do
+			if type(slot) == "table" then
+				n += tonumber(slot.count) or 1
+			end
+		end
+		return n
+	end
+
+	---------------- trade window helpers ----------------
+	local function getTradeFrame()
+		local gui = player:FindFirstChild("PlayerGui")
+		local menus = gui and gui:FindFirstChild("Menus")
+		return menus and menus:FindFirstChild("Trade")
+	end
+
+	-- The game moves its Prompt between Menus.Trade and Menus, so look in both
+	local promptRef
+	local function getPrompt()
+		if promptRef and promptRef.Parent then
+			return promptRef
+		end
+		local trade = getTradeFrame()
+		promptRef = trade and (trade:FindFirstChild("Prompt") or (trade.Parent and trade.Parent:FindFirstChild("Prompt")))
+		return promptRef
+	end
+
+	local function isTradeOpen()
+		local trade = getTradeFrame()
+		return trade ~= nil and trade.Visible
+	end
+
+	-- The game's trade script declines an "Accept" unless this prompt is showing,
+	-- so the alt shows it exactly like the game does when you send a request yourself
+	local function showRequestPrompt()
 		pcall(function()
-			c:Disconnect()
+			local trade, prompt = getTradeFrame(), getPrompt()
+			prompt.Title.Text = "Trade Request Sent"
+			prompt.Description.Text = "Waiting for other player"
+			prompt.Confirm.Visible = false
+			prompt.Parent = trade.Parent
+			prompt.Visible = true
 		end)
 	end
-	table.clear(connections)
-	if Window then
-		Window:Destroy()
+
+	local function hidePrompt()
+		pcall(function()
+			local trade, prompt = getTradeFrame(), getPrompt()
+			prompt.Visible = false
+			prompt.Parent = trade
+		end)
 	end
-end
-_G.EggFarm = { Stop = stop }
 
-local function notify(title, content)
-	Ember:Notify({ Title = title, Content = content, Duration = 4 })
-end
-
-Window = Ember:CreateWindow({
-	Title = "EFSR",
-	Subtitle = "sigma",
-	ConfigFolder = "EggFarmSim",
-	ToggleKey = Enum.KeyCode.K,
-	OnClose = stop,
-})
-
-Window:Section("Farming")
-local MainTab = Window:Tab({ Name = "Main" })
-local HeroTab = Window:Tab({ Name = "Heroes" })
-local BossTab = Window:Tab({ Name = "Boss" })
-local TrophyTab = Window:Tab({ Name = "Trophies" })
-local ItemsTab = Window:Tab({ Name = "Items" })
-local AbilitiesTab = Window:Tab({ Name = "Abilities" })
-Window:Section("Accounts")
-local TradeTab = Window:Tab({ Name = "Alt / Master" })
-Window:Section("Info")
-local StatusTab = Window:Tab({ Name = "Status" })
-Window:Section("Settings")
-local SettingsTab = Window:Tab({ Name = "Settings" })
-
--- Live paragraphs, refreshed once a second at the bottom of the file
-local live = {}
-
----------------- Main tab: attack + auto advance on top, collecting below ----------------
----------------- Attack ----------------
-local AttackCard = MainTab:Card({ Title = "Auto Attack", Side = "Left" })
-AttackCard:Toggle({
-	Name = "Auto Attack My Chicken",
-	Flag = "AutoAttack",
-	Keybind = true,
-	Tooltip = "Attacks your own farm's chicken nonstop. Pauses for boss fights and trades.",
-	Callback = function(v)
-		Attack.Enabled = v
-	end,
-})
-AttackCard:Slider({
-	Name = "Attacks Per Second",
-	Min = 1,
-	Max = 60,
-	Increment = 1,
-	Default = 30,
-	Flag = "AttackRate",
-	Tooltip = "The game normally attacks at your multiplier (CPS + wings tier) per second. "
-		.. "Higher is sent if you ask for it, but the server may only count up to its own limit.",
-	Callback = function(v)
-		Attack.Rate = v
-	end,
-})
-AttackCard:Toggle({
-	Name = "Stay Next to My Chicken",
-	Default = true,
-	Flag = "AttackStayNear",
-	Tooltip = "Teleports you back beside your chicken whenever you're out of reach (8 studs). "
-		.. "Diamond collection and the boss fight still take you away when they need to.",
-	Callback = function(v)
-		Attack.StayNear = v
-	end,
-})
-live.attack = AttackCard:Paragraph({ Content = "-" })
-
----------------- Auto Advance ----------------
-local Advance = MainTab:Card({ Title = "Auto Advance", Side = "Right" })
-Advance:Toggle({
-	Name = "Auto Advance When Ready",
-	Flag = "AutoAdvance",
-	Keybind = true,
-	Tooltip = "Advances the moment the chicken bar is full.",
-	Callback = function(v)
-		State.AutoAdvance = v
-		if v then
-			task.spawn(tryAdvance)
+	-- Hiding the window makes the game's trade script send Decline and reset itself
+	local function closeTrade()
+		local trade = getTradeFrame()
+		if trade and trade.Visible then
+			trade.Visible = false
 		end
-	end,
-})
-live.chickens = Advance:Progress({ Name = "Chickens" })
-live.progress = Advance:Paragraph({ Content = "-" })
-Advance:Button({
-	Name = "Advance Now",
-	Callback = function()
-		local current, needed = getProgress()
-		if current and needed and current < needed then
-			notify("Progress", ("Not ready yet (%d / %d)."):format(current, needed))
+		hidePrompt()
+	end
+
+	---------------- trade events ----------------
+	local TradeInfo = {
+		phase = "Idle", -- Idle / Requesting / Offering / Confirming / Receiving
+		partner = nil,
+		startedAt = 0,
+		message = "-",
+		received = {},
+		receivedDiamonds = 0,
+		trades = 0,
+		items = 0,
+		diamonds = 0,
+	}
+
+	local FAIL_EVENTS = {
+		Busy = "%s can't trade right now",
+		Decline = "%s cancelled the trade",
+		Throttle = "Trade cooldown (%ss)",
+		Disable = "Trading is turned off",
+		FriendsOnly = "Friends-only trading is on",
+		Leave = "%s left the game",
+	}
+
+	local function failMessage(kind, arg)
+		return (FAIL_EVENTS[kind] or kind):format(tostring(arg or "?"))
+	end
+
+	local function resetTradeInfo(message)
+		TradeInfo.phase = "Idle"
+		TradeInfo.partner = nil
+		TradeInfo.received = {}
+		TradeInfo.receivedDiamonds = 0
+		if message then
+			TradeInfo.message = message
+		end
+	end
+
+	local pending = {} -- latest [eventName] = { arg1, arg2 } from the server
+
+	-- Waits for `want` (or any failure). Returns the event name and its first argument, or nil on timeout.
+	local function waitForEvent(want, timeout, partner)
+		local start = os.clock()
+		while alive() and os.clock() - start < timeout do
+			if pending[want] then
+				return want, pending[want][1]
+			end
+			for kind in pairs(FAIL_EVENTS) do
+				local hit = pending[kind]
+				if hit and (kind ~= "Leave" or hit[1] == partner) then
+					return kind, hit[1]
+				end
+			end
+			task.wait(0.1)
+		end
+		return nil
+	end
+
+	---------------- master side ----------------
+	local function isAllowedAlt(name)
+		if TradeSettings.AcceptAnyone then
+			return true
+		end
+		local lower = string.lower(tostring(name))
+		if TradeSettings.ExtraAlts[lower] then
+			return true
+		end
+		for _, alt in ipairs(knownAlts()) do
+			if string.lower(alt) == lower then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function masterAccept(from)
+		if currentRole ~= "Master" or not TradeSettings.AutoAccept or TradeInfo.partner then
 			return
 		end
-		task.spawn(advance)
-	end,
-})
-
----------------- Collect ----------------
-local Diamonds = MainTab:Card({ Title = "Diamonds", Side = "Left" })
-Diamonds:Toggle({
-	Name = "Auto Collect Diamonds",
-	Flag = "AutoDiamonds",
-	Keybind = true,
-	Callback = function(v)
-		State.Diamonds = v
-	end,
-})
-Diamonds:Toggle({
-	Name = "Return to Spot After",
-	Default = true,
-	Flag = "ReturnAfterDiamonds",
-	Tooltip = "Teleports you back to where you were once every diamond is collected.",
-	Callback = function(v)
-		State.ReturnAfterDiamonds = v
-	end,
-})
-Diamonds:Slider({
-	Name = "Skip Stuck Diamond After",
-	Min = 0.5,
-	Max = 5,
-	Increment = 0.5,
-	Default = 1.5,
-	Suffix = "s",
-	Flag = "DiamondTimeout",
-	Tooltip = "A diamond that's still there after this long is skipped until you reset the skipped list.",
-	Callback = function(v)
-		State.DiamondTimeout = v
-	end,
-})
-live.diamonds = Diamonds:Paragraph({ Content = "-" })
-Diamonds:Button({
-	Name = "Reset Skipped Diamonds",
-	Style = "Secondary",
-	Callback = function()
-		table.clear(skippedDiamonds)
-		notify("Diamonds", "Skipped list cleared.")
-	end,
-})
-
-local Pickups = MainTab:Card({ Title = "Meat & Grapes", Side = "Right" })
-Pickups:Toggle({
-	Name = "Auto Collect Meat",
-	Flag = "AutoMeat",
-	Keybind = true,
-	Callback = function(v)
-		State.Meat = v
-	end,
-})
-Pickups:Slider({
-	Name = "Meat Range",
-	Min = 10,
-	Max = 200,
-	Increment = 5,
-	Default = 50,
-	Suffix = " studs",
-	Flag = "MeatRange",
-	Callback = function(v)
-		State.MeatRange = v
-	end,
-})
-Pickups:Toggle({
-	Name = "Auto Collect Grapes",
-	Flag = "AutoGrapes",
-	Keybind = true,
-	Callback = function(v)
-		State.Grapes = v
-	end,
-})
-Pickups:Slider({
-	Name = "Sweep Interval",
-	Min = 0.1,
-	Max = 2,
-	Increment = 0.05,
-	Default = 0.25,
-	Suffix = "s",
-	Flag = "TouchInterval",
-	Tooltip = "How often meat and grapes are rescanned. New ones are also grabbed the instant they spawn.",
-	Callback = function(v)
-		State.TouchInterval = v
-	end,
-})
-live.pickups = Pickups:Paragraph({ Content = "-" })
-
----------------- Heroes ----------------
-local HeroFarm = HeroTab:Card({ Title = "Hero Autofarm", Side = "Left" })
-HeroFarm:Toggle({
-	Name = "Hero Autofarm",
-	Flag = "HeroAutofarm",
-	Keybind = true,
-	Callback = function(v)
-		State.HeroFarm = v
-		if v then
-			heroNextTick = 0
+		if not isAllowedAlt(from) then
+			log("Ignoring trade request from", from)
+			return
 		end
-	end,
-})
-HeroFarm:Paragraph({
-	Content = "Every 5s max-upgrades your 3 best heroes (every upgrade each hero has). Every 3rd tick it also upgrades "
-		.. "the next batch of 5, starting from your worst heroes and wrapping around. Every 2nd tick it tries to buy the next hero.",
-})
-local HeroLive = HeroTab:Card({ Title = "Live", Side = "Right" })
-live.heroes = HeroLive:Paragraph({ Content = "-" })
-
-local Single = HeroTab:Card({ Title = "Single Hero Mode", Side = "Left" })
-Single:Toggle({
-	Name = "Only Upgrade One Hero",
-	Flag = "SingleHero",
-	Tooltip = "Skips the best-heroes and batch upgrades and only upgrades the hero picked below.",
-	Callback = function(v)
-		State.SingleHero = v
-	end,
-})
-Single:Dropdown({
-	Name = "Hero",
-	Options = heroOptions(),
-	Default = heroLabel(State.SingleHeroId),
-	Search = true,
-	Flag = "SingleHeroPick",
-	Callback = function(label)
-		local id = idFromLabel(label)
-		if id then
-			State.SingleHeroId = id
+		-- let a box that's opening finish first, or its reveal would close the trade
+		waitingToAccept = true
+		local start = os.clock()
+		while alive() and boxBusy() and os.clock() - start < 15 do
+			task.wait(0.1)
 		end
-	end,
-})
-
-local HeroManual = HeroTab:Card({ Title = "Manual", Side = "Right" })
-HeroManual:Button({
-	Name = "Run One Tick Now",
-	Callback = function()
-		task.spawn(heroFarmTick, true)
-	end,
-})
-HeroManual:Button({
-	Name = "Buy Next Hero Now",
-	Style = "Secondary",
-	Callback = function()
-		task.spawn(buyNextHero)
-	end,
-})
-HeroManual:Button({
-	Name = "Restart Batches From Worst",
-	Style = "Secondary",
-	Callback = function()
-		batchIndex = 0
-		notify("Heroes", "Next batch will start from your worst heroes.")
-	end,
-})
-
----------------- Boss ----------------
-local BossFarm = BossTab:Card({ Title = "Boss Farm", Side = "Left" })
-BossFarm:Toggle({
-	Name = "Boss Farm",
-	Flag = "BossFarm",
-	Keybind = true,
-	Callback = function(v)
-		State.BossFarm = v
-	end,
-})
-BossFarm:Paragraph({
-	Content = "When the rocket countdown hits 10 you're sent to the rocket to wait for the boss, then you attack "
-		.. "from above it while dodging CandyCorn and Target attacks. Diamonds pause until the fight ends.",
-})
-BossFarm:Toggle({
-	Name = "Return to Start Spot After",
-	Flag = "BossReturn",
-	Callback = function(v)
-		State.BossReturn = v
-	end,
-})
-
-local BossLive = BossTab:Card({ Title = "Live", Side = "Right" })
-live.boss = BossLive:Paragraph({ Content = "-" })
-BossLive:Button({
-	Name = "Teleport to Rocket Now",
-	Style = "Secondary",
-	Callback = function()
-		if not teleportToRocket() then
-			notify("Boss", "Couldn't find the rocket.")
+		task.wait(0.3) -- let the game finish showing its "Trade Requested" prompt
+		waitingToAccept = false
+		if not alive() or isTradeOpen() then
+			return
 		end
-	end,
-})
+		-- the boss fight comes first: turn the request down, the alt tries again later
+		if bossBusy() then
+			pcall(function()
+				TradeEvent:FireServer("Decline", from)
+			end)
+			hidePrompt()
+			TradeInfo.message = ("Declined %s's request: fighting the boss"):format(from)
+			return
+		end
 
----------------- Trophies ----------------
-local Reroll = TrophyTab:Card({ Title = "Auto Reroll", Side = "Left" })
-Reroll:Toggle({
-	Name = "Auto Reroll Trophies",
-	Flag = "AutoReroll",
-	Keybind = true,
-	Callback = function(v)
-		State.AutoReroll = v
-	end,
-})
-Reroll:Dropdown({
-	Name = "Saved Trophies",
-	Multi = true,
-	Search = true,
-	Options = heroOptions(),
-	Default = { heroLabel(2), heroLabel(26), heroLabel(40) },
-	Placeholder = "None (rerolls everything)",
-	Flag = "SavedTrophyList",
-	Tooltip = "Trophies picked here are never rerolled. Each trophy shares its ID with a hero.",
-	Callback = function(labels)
-		State.SavedTrophies = savedFromLabels(labels)
-	end,
-})
-Reroll:Slider({
-	Name = "Delay Between Rerolls",
-	Min = 0.05,
-	Max = 2,
-	Increment = 0.05,
-	Default = 0.25,
-	Suffix = "s",
-	Flag = "RerollDelay",
-	Callback = function(v)
-		State.RerollDelay = v
-	end,
-})
-Reroll:Button({
-	Name = "Reroll Unsaved Once",
-	Callback = function()
-		task.spawn(function()
-			notify("Trophies", ("Rerolled %d trophies."):format(rerollPass(true)))
+		resetTradeInfo(("Trading with %s"):format(from))
+		TradeInfo.partner, TradeInfo.phase, TradeInfo.startedAt = from, "Receiving", os.clock()
+
+		-- same as pressing the game's Accept button
+		pcall(function()
+			TradeEvent:FireServer("Accept", from)
 		end)
-	end,
-})
+		hidePrompt()
+		local trade = getTradeFrame()
+		if trade then
+			trade.Visible = true
+		end
+	end
 
-local TrophyLive = TrophyTab:Card({ Title = "Live", Side = "Right" })
-live.trophies = TrophyLive:Paragraph({ Content = "-" })
+	-- Confirms once the alt has confirmed. The master never offers anything back.
+	local function masterConfirm()
+		local partner = TradeInfo.partner
+		if currentRole ~= "Master" or not partner or TradeInfo.phase ~= "Receiving" then
+			return
+		end
+		TradeInfo.phase = "Confirming"
+		task.wait(0.5)
+		pcall(function()
+			TradeEvent:FireServer("Confirm", partner, {
+				Giving = {},
+				Receiving = TradeInfo.received,
+				GivingD = {},
+				ReceivingD = TradeInfo.receivedDiamonds > 0 and { amount = TradeInfo.receivedDiamonds } or {},
+			})
+		end)
+	end
 
----------------- Items, Abilities + Alt / Master ----------------
--- Live in their own file on GitHub so this script stays small enough to paste.
--- If it can't load, only those two tabs are affected: they show why, everything else runs.
-local TRADING_URL = "https://raw.githubusercontent.com/sillysteals/main/refs/heads/main/egg_farm_trading.lua"
-local tradingOk, tradingErr = pcall(function()
-	local source = game:HttpGet(TRADING_URL)
-	if type(source) ~= "string" or source:sub(1, 3) == "404" then
-		error("egg_farm_trading.lua isn't on GitHub at that link yet (404).", 0)
+	local function onTradeEvent(kind, a, b)
+		pending[kind] = { a, b }
+
+		if kind == "Request" then
+			if currentRole == "Master" then
+				task.spawn(masterAccept, a)
+			end
+		elseif kind == "Sync" then
+			if a == TradeInfo.partner and type(b) == "table" then
+				TradeInfo.received = b
+			end
+		elseif kind == "Diamonds" then
+			if a == TradeInfo.partner then
+				TradeInfo.receivedDiamonds = tonumber(b) or 0
+			end
+		elseif kind == "Confirm" then
+			task.spawn(masterConfirm)
+		elseif kind == "Success" then
+			if currentRole == "Master" and TradeInfo.partner then
+				local items, diamonds = countSlots(TradeInfo.received), TradeInfo.receivedDiamonds
+				TradeInfo.trades += 1
+				TradeInfo.items += items
+				TradeInfo.diamonds += diamonds
+				resetTradeInfo(("Received %d item(s)%s from %s"):format(
+					items, diamonds > 0 and (" + " .. diamonds .. " diamonds") or "", TradeInfo.partner))
+			end
+		elseif FAIL_EVENTS[kind] then
+			if currentRole == "Master" and TradeInfo.partner and (kind ~= "Leave" or a == TradeInfo.partner) then
+				resetTradeInfo(failMessage(kind, a))
+			end
+		end
 	end
-	local chunk, compileErr = loadstring(source)
-	if not chunk then
-		error("Couldn't compile egg_farm_trading.lua: " .. tostring(compileErr), 0)
+	if TradeEvent then
+		track(TradeEvent.OnClientEvent:Connect(onTradeEvent))
 	end
-	local setup = chunk()
-	if type(setup) ~= "function" then
-		error("The file at that link isn't egg_farm_trading.lua.", 0)
+
+	-- Master: give up on a trade that stalls
+	task.spawn(function()
+		while alive() do
+			if currentRole == "Master" and TradeInfo.partner and os.clock() - TradeInfo.startedAt > 60 then
+				local partner = TradeInfo.partner
+				closeTrade()
+				resetTradeInfo(("Trade with %s timed out"):format(partner))
+			end
+			task.wait(1)
+		end
+	end)
+
+	---------------- alt side ----------------
+	local REQUEST_TIMEOUT = 20 -- seconds for the master to accept
+	local unanswered = 0 -- requests in a row the master didn't answer
+	local CONFIRM_DELAY = 4.5  -- the game unlocks Accept 4s after the last change
+	local SUCCESS_TIMEOUT = 30 -- seconds for the master to confirm
+
+	-- One full trade to the master. Returns how long to wait before the next one.
+	local function altTradeOnce()
+		local name = getMasterName()
+		if not name then
+			TradeInfo.message = "No master set — pick Master on the main account, or type its name"
+			return 5
+		end
+		local masterPlayer = findPlayer(name)
+		if not masterPlayer then
+			TradeInfo.message = name .. " isn't in this server"
+			return 5
+		end
+		if masterPlayer == player then
+			TradeInfo.message = "This account can't send to itself"
+			return 10
+		end
+		local master = masterPlayer.Name -- exact spelling for the remote
+
+		if isTradeOpen() then
+			TradeInfo.message = "A trade window is already open"
+			return 3
+		end
+
+		local giving, diamonds, items, err = buildOffer()
+		if err then
+			TradeInfo.message = err
+			return 5
+		end
+		if items == 0 and diamonds <= 0 then
+			TradeInfo.message = "Nothing to send"
+			return 5
+		end
+
+		-- 1. request (nothing below yields before the request is out, so a box can't start in between)
+		if bossBusy() then
+			TradeInfo.message = "Waiting for the boss fight to end"
+			return 3
+		end
+		if boxBusy() then
+			TradeInfo.message = "Waiting for a box to finish opening"
+			return 1
+		end
+		table.clear(pending)
+		resetTradeInfo("Requesting a trade with " .. master)
+		TradeInfo.partner, TradeInfo.phase, TradeInfo.startedAt = master, "Requesting", os.clock()
+		showRequestPrompt()
+		pcall(function()
+			TradeEvent:FireServer("Request", master)
+		end)
+
+		local kind, arg = waitForEvent("Accept", REQUEST_TIMEOUT, master)
+		if kind ~= "Accept" then
+			hidePrompt()
+			if kind == nil then
+				pcall(function()
+					TradeEvent:FireServer("Decline")
+				end)
+			end
+			resetTradeInfo(kind and failMessage(kind, arg) or (master .. " didn't accept in time"))
+			if kind == "Throttle" then
+				return (tonumber(arg) or 5) + 1
+			elseif kind == "Disable" or kind == "FriendsOnly" then
+				return 30
+			elseif kind == nil or kind == "Decline" or kind == "Busy" then
+				-- the master isn't taking trades right now (auto accept off, fighting the boss...):
+				-- wait longer each time so farming here isn't stuck paused on requests
+				unanswered += 1
+				local waitTime = math.min(15 * unanswered, 60)
+				TradeInfo.message ..= (" — trying again in %ds"):format(waitTime)
+				return waitTime
+			end
+			return 5
+		end
+		unanswered = 0
+
+		-- 2. offer
+		TradeInfo.phase = "Offering"
+		TradeInfo.message = ("Offering %d item(s)%s"):format(items, diamonds > 0 and (" + " .. diamonds .. " diamonds") or "")
+		task.wait(0.5)
+		pcall(function()
+			TradeEvent:FireServer("Sync", master, giving)
+		end)
+		if diamonds > 0 then
+			pcall(function()
+				TradeEvent:FireServer("Diamonds", master, diamonds)
+			end)
+		end
+
+		local failed, failArg = waitForEvent("__none", CONFIRM_DELAY, master)
+		if failed then
+			resetTradeInfo(failMessage(failed, failArg))
+			return 5
+		end
+
+		-- 3. confirm, then wait for the master
+		TradeInfo.phase = "Confirming"
+		pcall(function()
+			TradeEvent:FireServer("Confirm", master, {
+				Giving = giving,
+				Receiving = {},
+				GivingD = diamonds > 0 and { amount = diamonds } or {},
+				ReceivingD = {},
+			})
+		end)
+
+		local done, doneArg = waitForEvent("Success", SUCCESS_TIMEOUT, master)
+		if done == "Success" then
+			TradeInfo.trades += 1
+			TradeInfo.items += items
+			TradeInfo.diamonds += diamonds
+			resetTradeInfo(("Sent %d item(s)%s to %s"):format(items, diamonds > 0 and (" + " .. diamonds .. " diamonds") or "", master))
+			return 2 -- give the inventory a moment to update
+		end
+		if done == nil then
+			closeTrade()
+			resetTradeInfo(master .. " didn't confirm in time")
+		else
+			resetTradeInfo(failMessage(done, doneArg))
+		end
+		return 5
 	end
-	tradingApi = setup({
-		Tab = TradeTab,
-		bossBusy = function()
-			return bossActive
+
+	task.spawn(function()
+		while alive() do
+			local waitTime = 1
+			if currentRole == "Alt" and TradeSettings.AutoSend then
+				local ok, result = pcall(altTradeOnce)
+				if ok then
+					waitTime = result or 3
+				else
+					warn("[EggFarm] Trade error:", result)
+					resetTradeInfo("Error: " .. tostring(result))
+					waitTime = 5
+				end
+			end
+			task.wait(waitTime)
+		end
+	end)
+
+	---------------- menu option lists ----------------
+	local function boxOptions()
+		local list = {}
+		if BoxData and type(BoxData.Name) == "table" then
+			local tiers = {}
+			for tier in pairs(BoxData.Name) do
+				if tonumber(tier) then
+					table.insert(tiers, tonumber(tier))
+				end
+			end
+			table.sort(tiers)
+			for _, tier in ipairs(tiers) do
+				table.insert(list, ("[%d] %s Box"):format(tier, tostring(BoxData.Name[tier])))
+			end
+		end
+		return list
+	end
+
+	local function itemOptions(cat)
+		local list = {}
+		local folder = ItemsFolder and ItemsFolder:FindFirstChild(cat)
+		if folder then
+			for _, item in ipairs(folder:GetChildren()) do
+				table.insert(list, item.Name)
+			end
+		end
+		table.sort(list)
+		return list
+	end
+
+	-- Dropdown labels -> the keys filterKey() produces
+	local function setFilter(cat, labels)
+		local set = {}
+		for _, label in ipairs(labels or {}) do
+			if cat == "Boxes" or cat == "Trophies" then
+				local id = idFromLabel(label)
+				if id then
+					set[tostring(id)] = true
+				end
+			else
+				set[tostring(label)] = true
+			end
+		end
+		TradeSettings.Filter[cat] = set
+	end
+
+	local function toSet(list)
+		local set = {}
+		for _, v in ipairs(list or {}) do
+			set[v] = true
+		end
+		return set
+	end
+
+	local function parseNames(text)
+		local set = {}
+		for name in tostring(text or ""):gmatch("[^,%s]+") do
+			set[string.lower(name)] = true
+		end
+		return set
+	end
+
+	-- True while a trade window, a trade request or one of our own trades is in progress
+	local function tradeActive()
+		if TradeInfo.partner ~= nil or waitingToAccept then
+			return true
+		end
+		local trade = getTradeFrame()
+		if trade and trade.Visible then
+			return true
+		end
+		-- while it's showing, the game moves its trade prompt out of Menus.Trade into Menus
+		local menus = trade and trade.Parent
+		local prompt = menus and menus:FindFirstChild("Prompt")
+		local title = prompt and prompt:FindFirstChild("Title")
+		return prompt ~= nil and prompt.Visible and title ~= nil and tostring(title.Text):find("Trade") ~= nil
+	end
+
+	------------------------------------------------------------------
+	-- Auto Sell (weapons, wings and trails; trophies and boxes are never touched)
+	------------------------------------------------------------------
+	local SELL_TYPES = { "Weapons", "Wings", "Trails" }
+
+	local Sell = {
+		Enabled = false,
+		Types = { Weapons = true, Wings = true, Trails = true },
+		KeepTiers = {}, -- [tier] = true
+		Keep = { Weapons = {}, Wings = {}, Trails = {} }, -- [category][item name] = true
+		Delay = 0.15,
+		sold = 0,
+		diamonds = 0,
+		message = "-",
+	}
+
+	-- Rarity name for a tier ("Legendary"), from the game's BoxData
+	local function rarityName(tier)
+		return BoxData and type(BoxData.Rarity) == "table" and BoxData.Rarity[tier] or nil
+	end
+
+	-- Name and tier of an inventory entry. Weapons are keyed "Name#abilities".
+	local function itemInfo(cat, key, value)
+		local name = cat == "Weapons" and type(value) == "table" and tostring(value[1]) or tostring(key)
+		local folder = ItemsFolder and ItemsFolder:FindFirstChild(cat)
+		local item = folder and folder:FindFirstChild(name)
+		local tier = item and item:FindFirstChild("Tier")
+		return name, tier and tonumber(tier.Value) or nil
+	end
+
+	-- Everything that would be sold right now: { cat, key, name, tier, count }
+	local function getSellList()
+		local data, err = getData()
+		if not data then
+			return nil, err
+		end
+		local list = {}
+		for _, cat in ipairs(SELL_TYPES) do
+			local inv = data.inventory[string.lower(cat)]
+			local equipped = type(data.using) == "table" and data.using[string.lower(cat)] or nil
+			if Sell.Types[cat] and type(inv) == "table" then
+				for key, value in pairs(inv) do
+					local count
+					if cat == "Weapons" then
+						count = type(value) == "table" and (tonumber(value[3]) or 1) or 0
+					else
+						count = tonumber(value) or 0
+					end
+					local name, tier = itemInfo(cat, key, value)
+					local keptTier = next(Sell.KeepTiers) ~= nil and (tier == nil or Sell.KeepTiers[tier])
+					local isEquipped = equipped ~= nil and tostring(key) == tostring(equipped)
+					if count > 0 and not isEquipped and not keptTier and not Sell.Keep[cat][name] then
+						table.insert(list, { cat = cat, key = key, name = name, tier = tier, count = count })
+					end
+				end
+			end
+		end
+		return list
+	end
+
+	-- Diamonds the game pays for one item (30% of its tier's box price, same as its sell menu)
+	local function sellPrice(tier)
+		local price = BoxData and type(BoxData.Price) == "table" and tier and tonumber(BoxData.Price[tier])
+		return price and math.floor(price * 0.3) or 0
+	end
+
+	-- Sells everything on the list, one copy per call, re-reading the inventory
+	-- between rounds until nothing sellable is left
+	local selling = false
+	local function sellAll(force)
+		if selling then
+			return 0
+		end
+		selling = true
+		local total = 0
+		local ok, err = pcall(function()
+			local lastCount
+			for _ = 1, 50 do -- safety cap on rounds
+				local list, listErr = getSellList()
+				if not list then
+					Sell.message = listErr
+					return
+				end
+				if #list == 0 then
+					break
+				end
+				-- stop instead of spamming if the last round didn't remove anything
+				local count = 0
+				for _, entry in ipairs(list) do
+					count += entry.count
+				end
+				if lastCount and count >= lastCount then
+					Sell.message = "Your inventory didn't change after selling, so the game may be rejecting the sells"
+					return
+				end
+				lastCount = count
+				for _, entry in ipairs(list) do
+					for _ = 1, entry.count do
+						if tradeActive() then
+							Sell.message = "Paused: a trade is active"
+							return
+						end
+						if not (alive() and (force or Sell.Enabled)) then
+							return
+						end
+						ItemsEvent:FireServer("Sell", entry.cat, entry.key)
+						total += 1
+						Sell.sold += 1
+						Sell.diamonds += sellPrice(entry.tier)
+						log("Sold", entry.cat, entry.key)
+						task.wait(Sell.Delay)
+					end
+				end
+				task.wait(0.5) -- let the inventory update before checking again
+			end
+			Sell.message = total > 0 and ("Sold %d item(s)"):format(total) or "Nothing to sell"
+		end)
+		if not ok then
+			Sell.message = "Error: " .. tostring(err)
+			warn("[EggFarm] Sell error:", err)
+		end
+		selling = false
+		return total
+	end
+
+	task.spawn(function()
+		while alive() do
+			if Sell.Enabled and not tradeActive() then
+				sellAll(false)
+				task.wait(2)
+			end
+			task.wait(0.5)
+		end
+	end)
+
+	------------------------------------------------------------------
+	-- Auto Open Boxes
+	-- Opening a box plays the game's reveal animation, which hides every other
+	-- menu, including an open trade window (and hiding the trade window cancels
+	-- the trade). So boxes are only opened while no trade is active or being set
+	-- up, and the trading code waits for a box to finish before starting one.
+	------------------------------------------------------------------
+	local BoxesEvent = Events:FindFirstChild("Boxes")
+
+	local Boxes = {
+		Enabled = false,
+		Only = {}, -- [tier] = true; empty = every box
+		Delay = 0.5,
+		opened = 0,
+		message = "-",
+	}
+
+	local boxOpenedAt = 0
+	if BoxesEvent then
+		track(BoxesEvent.OnClientEvent:Connect(function(kind)
+			if kind == "Open" then
+				boxOpenedAt = os.clock()
+			end
+		end))
+	end
+
+	-- Inventory keys of every box we'd open, in order
+	local function getBoxesToOpen()
+		local data, err = getData()
+		if not data then
+			return nil, err
+		end
+		local inv = data.inventory.boxes
+		local list = {}
+		if type(inv) == "table" then
+			for key, tier in pairs(inv) do
+				if next(Boxes.Only) == nil or Boxes.Only[tonumber(tier)] then
+					table.insert(list, key)
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			return tostring(a) < tostring(b)
+		end)
+		return list
+	end
+
+	-- Opens one box and waits for the game to start its reveal. Returns false if the
+	-- box wasn't opened because a trade started, nil if the game never answered.
+	local function openOneBox(key)
+		if tradeActive() then
+			return false
+		end
+		-- no yield between the check above and this, so a trade can't sneak in between
+		boxBusyUntil = os.clock() + 6
+		local before = boxOpenedAt
+		ItemsEvent:FireServer("Use", "Boxes", tostring(key))
+		local start = os.clock()
+		while alive() and boxOpenedAt == before and os.clock() - start < 5 do
+			task.wait(0.05)
+		end
+		local opened = boxOpenedAt ~= before
+		-- keep trades waiting until the reveal has had time to finish
+		boxBusyUntil = os.clock() + Boxes.Delay + 1
+		task.wait(Boxes.Delay)
+		return opened or nil
+	end
+
+	local openingBoxes = false
+	local function openAllBoxes(force)
+		if openingBoxes then
+			return 0
+		end
+		openingBoxes = true
+		local total, misses = 0, 0
+		local ok, err = pcall(function()
+			while alive() and (force or Boxes.Enabled) do
+				local list, listErr = getBoxesToOpen()
+				if not list then
+					Boxes.message = listErr
+					return
+				end
+				if #list == 0 then
+					break
+				end
+				local result = openOneBox(list[1]) -- keys shift after each open, so always re-read
+				if result == false then
+					Boxes.message = "Paused: a trade is active"
+					return
+				elseif result == nil then
+					misses += 1
+					if misses >= 3 then
+						Boxes.message = "The game stopped answering box opens; trying again shortly"
+						return
+					end
+				else
+					misses = 0
+					total += 1
+					Boxes.opened += 1
+					log("Opened box", list[1])
+				end
+			end
+			Boxes.message = total > 0 and ("Opened %d box(es)"):format(total) or "No boxes to open"
+		end)
+		if not ok then
+			Boxes.message = "Error: " .. tostring(err)
+			warn("[EggFarm] Box error:", err)
+		end
+		openingBoxes = false
+		return total
+	end
+
+	task.spawn(function()
+		while alive() do
+			if Boxes.Enabled and not tradeActive() then
+				openAllBoxes(false)
+				task.wait(2)
+			end
+			task.wait(0.5)
+		end
+	end)
+
+	local function boxText()
+		local lines = { bold("Auto open: ") .. (Boxes.Enabled and color("ON", GREEN) or color("OFF", GREY))
+			.. (tradeActive() and "  " .. color("paused for trade", YELLOW) or "") }
+		if dataJob then
+			local list = getBoxesToOpen()
+			if list then
+				table.insert(lines, bold("Boxes to open: ") .. #list)
+			end
+		end
+		table.insert(lines, bold("Opened: ") .. Boxes.opened)
+		table.insert(lines, bold("Last: ") .. esc(Boxes.message))
+		return table.concat(lines, "\n")
+	end
+
+	local function sellText()
+		local lines = { bold("Auto sell: ") .. (Sell.Enabled and color("ON", GREEN) or color("OFF", GREY)) }
+		if dataJob then
+			local list = getSellList()
+			if list then
+				local items, worth = 0, 0
+				for _, entry in ipairs(list) do
+					items += entry.count
+					worth += sellPrice(entry.tier) * entry.count
+				end
+				table.insert(lines, bold("Sellable now: ") .. items .. (worth > 0 and ("  (~%d 💎)"):format(worth) or ""))
+			end
+		else
+			table.insert(lines, bold("Sellable now: ") .. color("press Sell Now or turn on Auto Sell", GREY))
+		end
+		table.insert(lines, bold("Sold: ") .. Sell.sold .. (Sell.diamonds > 0 and ("  (~%d 💎)"):format(Sell.diamonds) or ""))
+		table.insert(lines, bold("Last: ") .. esc(Sell.message))
+		return table.concat(lines, "\n")
+	end
+
+	---------------- live text ----------------
+	local function tradeText()
+		local lines = { bold("Role: ") .. currentRole }
+		if currentRole == "Alt" then
+			local master, source = getMasterName()
+			if master then
+				local here = findPlayer(master) and color("in server", GREEN) or color("not in server", RED)
+				table.insert(lines, bold("Master: ") .. esc(master) .. " (" .. source .. ") · " .. here)
+			else
+				table.insert(lines, bold("Master: ") .. color("not set", RED))
+			end
+			table.insert(lines, bold("Auto send: ") .. (TradeSettings.AutoSend and color("ON", GREEN) or color("OFF", GREY)))
+			table.insert(lines, ("Trades %d · Items sent %d · Diamonds sent %d"):format(TradeInfo.trades, TradeInfo.items, TradeInfo.diamonds))
+		elseif currentRole == "Master" then
+			local alts = knownAlts()
+			table.insert(lines, bold("Auto accept: ") .. (TradeSettings.AutoAccept and color("ON", GREEN) or color("OFF", GREY)))
+			table.insert(lines, bold("Alts on this PC: ") .. (#alts > 0 and esc(table.concat(alts, ", ")) or "none"))
+			table.insert(lines, ("Trades %d · Items received %d · Diamonds received %d"):format(TradeInfo.trades, TradeInfo.items, TradeInfo.diamonds))
+		else
+			table.insert(lines, "Pick Alt or Master to start.")
+			return table.concat(lines, "\n")
+		end
+		local phaseColor = TradeInfo.phase == "Idle" and GREY or YELLOW
+		table.insert(lines, bold("Phase: ") .. color(TradeInfo.phase, phaseColor)
+			.. (TradeInfo.partner and (" with " .. esc(TradeInfo.partner)) or ""))
+		table.insert(lines, bold("Last: ") .. esc(TradeInfo.message))
+		return table.concat(lines, "\n")
+	end
+
+	------------------------------------------------------------------
+	-- Menu
+	------------------------------------------------------------------
+	---------------- Items tab ----------------
+	-- "[5] Legendary" labels for every rarity the game has
+	local rarityOptions = {}
+	if BoxData and type(BoxData.Rarity) == "table" then
+		local tiers = {}
+		for tier in pairs(BoxData.Rarity) do
+			if tonumber(tier) then
+				table.insert(tiers, tonumber(tier))
+			end
+		end
+		table.sort(tiers)
+		for _, tier in ipairs(tiers) do
+			table.insert(rarityOptions, ("[%d] %s"):format(tier, tostring(rarityName(tier))))
+		end
+	end
+
+	local SellCard = itemsTab:Card({ Title = "Auto Sell", Side = "Left" })
+	SellCard:Toggle({
+		Name = "Auto Sell Items",
+		Flag = "AutoSell",
+		Keybind = true,
+		Tooltip = "Keeps selling every weapon, wing and trail you get, except the ones kept on the right. "
+			.. "Trophies, boxes and anything equipped are never sold. If this account is an alt sending items to "
+			.. "the master, anything sold here can't be traded.",
+		Callback = function(v)
+			Sell.Enabled = v
 		end,
-		ItemsTab = ItemsTab,
-		AbilitiesTab = AbilitiesTab,
-		attacking = function()
-			return Attack.status == "Attacking"
-		end,
-		alive = alive,
-		track = track,
-		log = log,
-		notify = notify,
-		idFromLabel = idFromLabel,
-		heroOptions = heroOptions,
 	})
-end)
-if not tradingOk then
-	warn("[EggFarm] Items / trading didn't load:", tradingErr)
-	for _, tab in ipairs({ ItemsTab, AbilitiesTab, TradeTab }) do
-		tab:Card({ Title = "This tab didn't load" }):Paragraph({
-			Content = color(esc(tradingErr), RED)
-				.. "\n\nUpload <b>egg_farm_trading.lua</b> next to ember.lua on GitHub, then run the script again:\n"
-				.. esc(TRADING_URL),
+	SellCard:Dropdown({
+		Name = "Item Types to Sell",
+		Multi = true,
+		Options = SELL_TYPES,
+		Default = SELL_TYPES,
+		Placeholder = "Nothing",
+		Flag = "SellTypes",
+		Callback = function(list)
+			local set = {}
+			for _, cat in ipairs(list or {}) do
+				set[cat] = true
+			end
+			Sell.Types = set
+		end,
+	})
+	SellCard:Slider({
+		Name = "Delay Between Sells",
+		Min = 0.05,
+		Max = 1,
+		Increment = 0.05,
+		Default = 0.15,
+		Suffix = "s",
+		Flag = "SellDelay",
+		Callback = function(v)
+			Sell.Delay = v
+		end,
+	})
+	SellCard:Button({
+		Name = "Sell Now",
+		Callback = function()
+			task.spawn(function()
+				notify("Sell", ("Sold %d item(s)."):format(sellAll(true)))
+			end)
+		end,
+	})
+
+	local BoxCard = itemsTab:Card({ Title = "Auto Open Boxes", Side = "Left" })
+	BoxCard:Toggle({
+		Name = "Auto Open Boxes",
+		Flag = "AutoOpenBoxes",
+		Keybind = true,
+		Tooltip = "Opens your boxes one at a time. Pauses whenever a trade window or trade request is up, "
+			.. "because the box animation would close the trade. If this account is an alt sending boxes "
+			.. "to the master, opened boxes can't be traded.",
+		Callback = function(v)
+			Boxes.Enabled = v
+		end,
+	})
+	BoxCard:Dropdown({
+		Name = "Only Open These Boxes",
+		Multi = true,
+		Options = boxOptions(),
+		Placeholder = "All",
+		Flag = "OpenBoxTiers",
+		Callback = function(labels)
+			local set = {}
+			for _, label in ipairs(labels or {}) do
+				local tier = idFromLabel(label)
+				if tier then
+					set[tier] = true
+				end
+			end
+			Boxes.Only = set
+		end,
+	})
+	BoxCard:Slider({
+		Name = "Delay Between Boxes",
+		Min = 0,
+		Max = 5,
+		Increment = 0.25,
+		Default = 0.5,
+		Suffix = "s",
+		Flag = "OpenBoxDelay",
+		Tooltip = "Extra wait after each box so the reveal animation can finish.",
+		Callback = function(v)
+			Boxes.Delay = v
+		end,
+	})
+	BoxCard:Button({
+		Name = "Open All Now",
+		Callback = function()
+			task.spawn(function()
+				if tradeActive() then
+					notify("Boxes", "Finish or cancel the trade first.")
+					return
+				end
+				notify("Boxes", ("Opened %d box(es)."):format(openAllBoxes(true)))
+			end)
+		end,
+	})
+
+	local KeepCard = itemsTab:Card({ Title = "Never Sell", Side = "Right" })
+	KeepCard:Dropdown({
+		Name = "Keep These Rarities",
+		Multi = true,
+		Options = rarityOptions,
+		Placeholder = "None",
+		Flag = "SellKeepTiers",
+		Tooltip = "Items of these rarities are never sold.",
+		Callback = function(labels)
+			local set = {}
+			for _, label in ipairs(labels or {}) do
+				local tier = idFromLabel(label)
+				if tier then
+					set[tier] = true
+				end
+			end
+			Sell.KeepTiers = set
+		end,
+	})
+	for _, cat in ipairs(SELL_TYPES) do
+		KeepCard:Dropdown({
+			Name = "Keep These " .. cat,
+			Multi = true,
+			Search = true,
+			Options = itemOptions(cat),
+			Placeholder = "None",
+			Flag = "SellKeep" .. cat,
+			Callback = function(names)
+				local set = {}
+				for _, name in ipairs(names or {}) do
+					set[name] = true
+				end
+				Sell.Keep[cat] = set
+			end,
 		})
 	end
-end
 
----------------- Status ----------------
-local FarmCard = StatusTab:Card({ Title = "Farm", Side = "Left" })
-local statusFarm = FarmCard:Paragraph({ Content = "Searching..." })
-FarmCard:Button({
-	Name = "Re-find My Farm",
-	Style = "Secondary",
-	Callback = function()
-		local farm = getFarm(true)
-		notify("Farm", farm and ("Found: " .. farm.Name) or "Couldn't find your farm.")
-	end,
-})
-local statusProgress = StatusTab:Card({ Title = "Progress", Side = "Left" }):Paragraph({ Content = "-" })
-local statusBoss = StatusTab:Card({ Title = "Boss", Side = "Left" }):Paragraph({ Content = "-" })
-local statusHeroes = StatusTab:Card({ Title = "Heroes", Side = "Right" }):Paragraph({ Content = "-" })
-local statusTrophies = StatusTab:Card({ Title = "Trophies", Side = "Right" }):Paragraph({ Content = "-" })
-local statusSession = StatusTab:Card({ Title = "Session", Side = "Right" }):Paragraph({ Content = "-" })
-local statusServer = StatusTab:Card({ Title = "Server", Side = "Left" }):Paragraph({ Content = "-" })
+	local SellLive = itemsTab:Card({ Title = "Live", Side = "Right" })
+	local sellPara = SellLive:Paragraph({ Content = "-" })
+	local boxPara = SellLive:Paragraph({ Content = "-" })
 
----------------- Settings ----------------
-Ember:BuildSettings(SettingsTab)
+	---------------- Alt / Master tab ----------------
+	---------------- Alt / Master ----------------
+	local AccountCard = tab:Card({ Title = "Account", Side = "Left" })
+	local AltCard = tab:Card({ Title = "Send to Master", Side = "Left" })
+	local MasterCard = tab:Card({ Title = "Receive From Alts", Side = "Left" })
+	local TradeLive = tab:Card({ Title = "Live", Side = "Right" })
+	local FilterCard = tab:Card({ Title = "What to Send", Side = "Right" })
 
-local Script = SettingsTab:Card({ Title = "Script", Side = "Right" })
-Script:Toggle({
-	Name = "Swap Touch Arguments",
-	Flag = "SwapArgs",
-	Tooltip = "Flips the part order passed to firetouchinterest. Try this if diamonds, meat or grapes stop collecting.",
-	Callback = function(v)
-		State.SwapArgs = v
-	end,
-})
-Script:Toggle({
-	Name = "Debug Prints (F9)",
-	Flag = "DebugPrints",
-	Callback = function(v)
-		State.Debug = v
-	end,
-})
-Script:Label("Settings save automatically.")
-Script:Button({
-	Name = "Stop Everything & Close",
-	Callback = stop,
-})
+	local function applyRoleVisibility()
+		AltCard.Frame.Visible = currentRole == "Alt"
+		FilterCard.Frame.Visible = currentRole == "Alt"
+		MasterCard.Frame.Visible = currentRole == "Master"
+	end
 
-------------------------------------------------------------------
--- Live updates
-------------------------------------------------------------------
-task.spawn(function()
-	while alive() do
-		pcall(function()
-			local farm, progress, boss = farmText(), progressText(), bossText()
-			local heroes, trophies, sessionStats = heroText(), trophyText(), sessionText()
-
-			statusFarm:Set(farm)
-			statusProgress:Set(progress)
-			statusBoss:Set(boss)
-			statusHeroes:Set(heroes)
-			statusTrophies:Set(trophies)
-			statusSession:Set(sessionStats)
-			statusServer:Set(serverText())
-
-			live.diamonds:Set(table.concat({
-				bold("Waiting: ") .. countDiamonds(getDiamondFolder()),
-				bold("Collected: ") .. Stats.Diamonds,
-				bold("Skipped: ") .. countSkipped(),
-			}, "   "))
-			local attackColor = Attack.status == "Attacking" and GREEN or Attack.status == "Off" and GREY or YELLOW
-			live.attack:Set(table.concat({
-				bold("Status: ") .. color(Attack.status, attackColor),
-				bold("Attacks sent: ") .. Stats.Attacks,
-			}, "\n"))
-			live.pickups:Set(table.concat({
-				bold("Meat touches: ") .. Stats.Meat,
-				bold("Grape touches: ") .. Stats.Grapes .. "   " .. bold("Loaded: ") .. grapeTransmitters,
-			}, "\n"))
-			live.heroes:Set(heroes)
-			live.boss:Set(boss)
-			live.trophies:Set(trophies)
-
-			local current, needed = getProgress()
-			if current and needed and needed > 0 then
-				live.chickens:Set(current / needed, ("%d / %d"):format(current, needed))
-			else
-				live.chickens:Set(0, "-")
+	AccountCard:Dropdown({
+		Name = "This Account Is",
+		Options = { "Off", "Alt", "Master" },
+		Default = currentRole,
+		Tooltip = "Saved for this account only (EggFarmSim/accounts.json), so alts and the master can run on the same PC.",
+		Callback = function(role)
+			if not ROLES[role] or role == currentRole then
+				return
 			end
-			live.progress:Set(bold("Levels advanced: ") .. Stats.Advances)
+			if TradeInfo.partner then
+				closeTrade()
+				resetTradeInfo("Role changed, trade cancelled")
+			end
+			currentRole = role
+			applyRoleVisibility()
+			if not updateMyAccount({ role = role }) then
+				notify("Accounts", "Couldn't save the role — your executor has no file access.")
+			end
+		end,
+	})
+	AccountCard:Label("Account: " .. esc(player.Name))
+
+	---- alt
+	AltCard:Input({
+		Name = "Master Username",
+		Default = (myAccount() or {}).master or "",
+		Placeholder = "Auto (Master on this PC)",
+		Tooltip = "Leave empty to use whichever account is set as Master on this PC. Type a name if the master runs on another PC.",
+		Callback = function(text)
+			updateMyAccount({ master = (tostring(text or ""):gsub("%s", "")) })
+		end,
+	})
+	AltCard:Toggle({
+		Name = "Auto Send to Master",
+		Flag = "TradeAutoSend",
+		Keybind = true,
+		Tooltip = "Keeps trading the items picked under What to Send to the master while it's in your server.",
+		Callback = function(v)
+			TradeSettings.AutoSend = v
+		end,
+	})
+	AltCard:Toggle({
+		Name = "Send Diamonds",
+		Flag = "TradeSendDiamonds",
+		Callback = function(v)
+			TradeSettings.Diamonds = v
+		end,
+	})
+	AltCard:Input({
+		Name = "Keep Diamonds",
+		Default = "0",
+		Placeholder = "0",
+		Numeric = true,
+		Flag = "TradeKeepDiamonds",
+		Tooltip = "How many diamonds stay on the alt when Send Diamonds is on.",
+		Callback = function(n)
+			TradeSettings.KeepDiamonds = math.max(0, math.floor(tonumber(n) or 0))
+		end,
+	})
+	AltCard:Toggle({
+		Name = "Send Whole Stacks",
+		Flag = "TradeSendStacks",
+		Tooltip = "Puts every copy of a weapon, wing, trail or trophy into one slot instead of one copy per slot. "
+			.. "Much faster, but the game's own menu never does this — turn it off if trades fail.",
+		Callback = function(v)
+			TradeSettings.Stacks = v
+		end,
+	})
+
+	FilterCard:Dropdown({
+		Name = "Item Types",
+		Multi = true,
+		Options = CATEGORIES,
+		Default = { "Boxes" },
+		Placeholder = "Nothing",
+		Flag = "TradeTypes",
+		Callback = function(list)
+			TradeSettings.Types = toSet(list)
+		end,
+	})
+	FilterCard:Paragraph({ Content = "Narrow a type down below. Leave a list on <b>All</b> to send everything of that type." })
+	for _, cat in ipairs(CATEGORIES) do
+		local options
+		if cat == "Boxes" then
+			options = boxOptions()
+		elseif cat == "Trophies" then
+			options = heroOptions()
+		else
+			options = itemOptions(cat)
+		end
+		FilterCard:Dropdown({
+			Name = "Only These " .. cat,
+			Multi = true,
+			Search = true,
+			Options = options,
+			Placeholder = "All",
+			Flag = "TradeOnly" .. cat,
+			Callback = function(labels)
+				setFilter(cat, labels)
+			end,
+		})
+	end
+
+	---- master
+	MasterCard:Toggle({
+		Name = "Auto Accept Alt Trades",
+		Flag = "TradeAutoAccept",
+		Keybind = true,
+		Tooltip = "Accepts and confirms trades from your alts. The master never puts anything in the trade.",
+		Callback = function(v)
+			TradeSettings.AutoAccept = v
+		end,
+	})
+	MasterCard:Input({
+		Name = "Other Alt Usernames",
+		Placeholder = "alt1, alt2",
+		Flag = "TradeExtraAlts",
+		Tooltip = "Alts set up on this PC are trusted automatically. List alts that run on other PCs here.",
+		Callback = function(text)
+			TradeSettings.ExtraAlts = parseNames(text)
+		end,
+	})
+	MasterCard:Toggle({
+		Name = "Accept From Anyone",
+		Flag = "TradeAcceptAnyone",
+		Tooltip = "Accepts trade requests from any player, not just your alts. The master still never gives anything.",
+		Callback = function(v)
+			TradeSettings.AcceptAnyone = v
+		end,
+	})
+
+	local livePara = TradeLive:Paragraph({ Content = "-" })
+	applyRoleVisibility()
+
+	------------------------------------------------------------------
+	-- Auto Abilities
+	-- Abilities are used with Events.Abilities:FireServer(id), the same call the
+	-- game's own ability bar makes. data.cooldowns[id] is the server time each
+	-- ability is ready again. Two modes, which can run together:
+	--   • Groups: ordered lists of abilities. A group waits until every ability in
+	--     it is ready, then uses them in order (e.g. Decoy -> Super Saiyan -> Hamburger).
+	--     An ability can only be in one group.
+	--   • When ready: every other ability is used the moment its cooldown ends.
+	------------------------------------------------------------------
+	local abilitiesTab = ctx.AbilitiesTab
+	local AbilitiesEvent = Events and Events:FindFirstChild("Abilities")
+	local attacking = type(ctx.attacking) == "function" and ctx.attacking or function()
+		return true
+	end
+
+	local AbilitiesData = requireWithin("Settings", "AbilitiesData", 3)
+	if type(AbilitiesData) ~= "table" then
+		AbilitiesData = {}
+	end
+
+	local ABILITY_IDS = {}
+	for id in pairs(AbilitiesData) do
+		if tonumber(id) then
+			table.insert(ABILITY_IDS, tostring(id))
+		end
+	end
+	table.sort(ABILITY_IDS, function(a, b)
+		return tonumber(a) < tonumber(b)
+	end)
+
+	local function abilityName(id)
+		local info = AbilitiesData[tostring(id)]
+		return type(info) == "table" and tostring(info.title) or ("Ability " .. tostring(id))
+	end
+
+	local function abilityLabel(id)
+		return ("[%s] %s"):format(tostring(id), abilityName(id))
+	end
+
+	local GROUP_COUNT = 4
+	local STEPS_PER_GROUP = 5
+
+	local Abil = {
+		Asap = false, -- use abilities the moment they're ready (anything not in an active group)
+		GroupsOn = false,
+		OnlyAttacking = false,
+		Never = {}, -- [id] = true, skipped by "when ready"
+		Gap = 0.5, -- seconds between abilities
+	EarlyUse = true, -- use a group's quick abilities while it waits on a slow one
+		used = 0,
+		message = "-",
+		pending = {}, -- [id] = os.clock() it was sent, until the server's cooldown shows up
+	}
+
+	local Groups = {}
+	for g = 1, GROUP_COUNT do
+		Groups[g] = { enabled = false, steps = {}, runs = 0, status = "-" }
+	end
+
+	local function serverNow()
+		local ok, t = pcall(function()
+			return workspace:GetServerTimeNow()
 		end)
-		task.wait(1)
+		return ok and t or os.time()
 	end
-end)
 
-------------------------------------------------------------------
--- Saved settings (load now, auto-save on change)
-------------------------------------------------------------------
--- Per account, so alts and the master on one PC keep separate settings.
--- First run on an account starts from the old shared file.
-local CONFIG = "Autofarm-" .. player.UserId
-local restored = Ember:LoadConfig(CONFIG)
-if not restored then
-	restored = Ember:LoadConfig("Autofarm")
-end
+	-- The game's ability bar slot for an id (its Lock shows whether you've unlocked it)
+	local function getSlot(id)
+		local gui = player:FindFirstChild("PlayerGui")
+		local bar = gui and gui:FindFirstChild("Abilities")
+		local slots = bar and bar:FindFirstChild("Slots")
+		return slots and slots:FindFirstChild(tostring(id))
+	end
 
--- One-time move from the old RightShift default to K (a key you pick later sticks)
-pcall(function()
-	local marker = "EggFarmSim/.menukey-k"
-	if not isfile(marker) then
-		if Ember.Flags.Ember_MenuKey == "RightShift" and Ember.Options.Ember_MenuKey then
-			Ember.Options.Ember_MenuKey:Set("K")
+	-- "ready", "locked", or "cooldown" plus seconds left
+	local function abilityState(id, data)
+		local slot = getSlot(id)
+		local lock = slot and slot:FindFirstChild("Lock")
+		if lock and lock.Visible then
+			return "locked", 0
 		end
-		writefile(marker, "1")
-	end
-end)
-
-task.spawn(function()
-	local function snapshot()
-		local ok, json = pcall(HttpService.JSONEncode, HttpService, Ember.Flags)
-		return ok and json or nil
-	end
-	local last = snapshot()
-	while alive() do
-		task.wait(2)
-		local now = snapshot()
-		if alive() and now and now ~= last then
-			last = now
-			Ember:SaveConfig(CONFIG)
+		local cooldowns = data and type(data.cooldowns) == "table" and data.cooldowns or {}
+		local readyAt = tonumber(cooldowns[id] or cooldowns[tonumber(id)])
+		local left = readyAt and readyAt - serverNow() or 0
+		local sent = Abil.pending[id]
+		if sent then
+			if left > 0 or os.clock() - sent > 15 then
+				Abil.pending[id] = nil -- the server has taken it (or ignored it; try again)
+			else
+				return "cooldown", 1
+			end
 		end
+		if left > 0 then
+			return "cooldown", left
+		end
+		return "ready", 0
 	end
-end)
 
-------------------------------------------------------------------
--- Startup notice
-------------------------------------------------------------------
-local farm = getFarm()
-local lines = { farm and ("Farm found: " .. farm.Name) or "Your farm wasn't found yet." }
-if restored then
-	table.insert(lines, "Saved settings restored.")
+	local function useAbility(id)
+		if not AbilitiesEvent then
+			error("ReplicatedStorage.Events.Abilities wasn't found", 0)
+		end
+		AbilitiesEvent:FireServer(tostring(id))
+		Abil.pending[id] = os.clock()
+		Abil.used += 1
+		log("Used ability", id, abilityName(id))
+	end
+
+	-- Real cooldown of an ability: the base from AbilitiesData, cut by your equipped
+	-- weapon if it boosts that ability (same maths as the game's ability bar)
+	local WeaponCooldown = requireWithin("Settings", "WeaponCooldown", 3)
+	local function effectiveCooldown(id, data)
+		local info = AbilitiesData[id]
+		local cooldown = type(info) == "table" and tonumber(info.cooldown) or nil
+		if not cooldown then
+			return nil
+		end
+		local key = type(data.using) == "table" and data.using.weapons or nil
+		local weapons = type(data.inventory) == "table" and data.inventory.weapons or nil
+		local weapon = key ~= nil and type(weapons) == "table" and weapons[key] or nil
+		if type(weapon) == "table" and type(weapon[2]) == "table" and type(WeaponCooldown) == "table" then
+			local folder = ItemsFolder and ItemsFolder:FindFirstChild("Weapons")
+			local item = folder and folder:FindFirstChild(tostring(weapon[1]))
+			local tier = item and item:FindFirstChild("Tier")
+			local cut = tier and tonumber(WeaponCooldown[tier.Value])
+			if cut then
+				for _, ability in ipairs(weapon[2]) do
+					if tostring(ability) == id then
+						cooldown *= 1 - cut
+						break
+					end
+				end
+			end
+		end
+		return cooldown
+	end
+
+	-- Decoy and Hamburger change whatever ability comes next / came before, so using
+	-- them early would spend them on the wrong ability. They only fire with their group.
+	local NO_EARLY_USE = { ["8"] = true, ["9"] = true }
+	local EARLY_USE_MARGIN = 3 -- seconds of slack so an early use is always back in time
+
+	local function formatLeft(seconds)
+		seconds = math.max(0, math.ceil(seconds))
+		local h, m, s = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60
+		if h > 0 then
+			return ("%dh %02dm"):format(h, m)
+		end
+		return ("%dm %02ds"):format(m, s)
+	end
+
+	-- Steps of a group in order, skipping empty ones
+	local function groupSteps(g)
+		local list = {}
+		for k = 1, STEPS_PER_GROUP do
+			local id = Groups[g].steps[k]
+			if id then
+				table.insert(list, id)
+			end
+		end
+		return list
+	end
+
+	-- Abilities that belong to a group that's switched on (the "when ready" mode leaves these alone)
+	local function groupedIds()
+		local set = {}
+		if Abil.GroupsOn then
+			for g = 1, GROUP_COUNT do
+				if Groups[g].enabled then
+					for _, id in ipairs(groupSteps(g)) do
+						set[id] = true
+					end
+				end
+			end
+		end
+		return set
+	end
+
+	-- Why abilities can't be used right now, or nil
+	local function abilityBlocker()
+		if bossBusy() then
+			return "boss fight"
+		end
+		local char = player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if root and root.Position.Y > 5000 then
+			return "can't use abilities on the moon"
+		end
+		if tradeActive() then
+			return "trade"
+		end
+		if Abil.OnlyAttacking and not attacking() then
+			return "waiting for Auto Attack"
+		end
+		return nil
+	end
+
+	task.spawn(function()
+		while alive() do
+			task.wait(0.5)
+			if Abil.Asap or Abil.GroupsOn then
+				local ok, err = pcall(function()
+					local blocker = abilityBlocker()
+					if blocker then
+						Abil.message = "Paused: " .. blocker
+						return
+					end
+					local data, dataErr = getData()
+					if not data then
+						Abil.message = dataErr
+						return
+					end
+
+					-- groups first, in order
+					if Abil.GroupsOn then
+						for g = 1, GROUP_COUNT do
+							local group = Groups[g]
+							local steps = groupSteps(g)
+							if group.enabled and #steps > 0 then
+								local waitingOn, longest, locked = nil, 0, nil
+								for _, id in ipairs(steps) do
+									local state, left = abilityState(id, data)
+									if state == "locked" then
+										locked = id
+									elseif state == "cooldown" and left > longest then
+										waitingOn, longest = id, left
+									end
+								end
+								if locked then
+									group.status = "Locked: " .. abilityName(locked)
+								elseif waitingOn then
+									-- While waiting on the slowest ability, use any ready ability in this group
+									-- whose cooldown ends before the slowest one does, so it's still ready when
+									-- the whole group fires and its short cooldown isn't wasted.
+									if Abil.EarlyUse then
+										for _, id in ipairs(steps) do
+											local cooldown = not NO_EARLY_USE[id] and effectiveCooldown(id, data)
+											if cooldown and cooldown + EARLY_USE_MARGIN <= longest and abilityState(id, data) == "ready" then
+												if abilityBlocker() then
+													break
+												end
+												useAbility(id)
+												group.early = (group.early or 0) + 1
+												task.wait(Abil.Gap)
+											end
+										end
+									end
+									group.status = ("Waiting on %s (%s)"):format(abilityName(waitingOn), formatLeft(longest))
+										.. ((group.early or 0) > 0 and (" · %d early use%s"):format(group.early, group.early == 1 and "" or "s") or "")
+								else
+									group.status = "Using..."
+									for i, id in ipairs(steps) do
+										if abilityBlocker() then
+											break
+										end
+										if i > 1 then
+											task.wait(Abil.Gap)
+										end
+										useAbility(id)
+									end
+									group.runs += 1
+									group.early = 0
+									group.status = ("Used (%d time%s)"):format(group.runs, group.runs == 1 and "" or "s")
+									task.wait(Abil.Gap)
+								end
+							elseif group.enabled then
+								group.status = "Empty"
+							else
+								group.status = "Off"
+							end
+						end
+					end
+
+					-- everything else, the moment it's ready
+					if Abil.Asap then
+						local grouped = groupedIds()
+						for _, id in ipairs(ABILITY_IDS) do
+							if not grouped[id] and not Abil.Never[id] and abilityState(id, data) == "ready" then
+								if abilityBlocker() then
+									break
+								end
+								useAbility(id)
+								task.wait(Abil.Gap)
+							end
+						end
+					end
+					Abil.message = "Running"
+				end)
+				if not ok then
+					Abil.message = "Error: " .. tostring(err)
+					warn("[EggFarm] Ability error:", err)
+				end
+			else
+				Abil.message = "Off"
+			end
+		end
+	end)
+
+	local function abilityText()
+		local data = getData()
+		local lines = { bold("Status: ") .. esc(Abil.message), bold("Abilities used: ") .. Abil.used }
+		local grouped = groupedIds()
+		for _, id in ipairs(ABILITY_IDS) do
+			local state, left = abilityState(id, data)
+			local text
+			if state == "locked" then
+				text = color("locked", GREY)
+			elseif state == "cooldown" then
+				text = color(formatLeft(left), YELLOW)
+			else
+				text = color("ready", GREEN)
+			end
+			local tag = grouped[id] and " (group)" or (Abil.Never[id] and " (never)" or "")
+			table.insert(lines, esc(abilityName(id)) .. tag .. ": " .. text)
+		end
+		return table.concat(lines, "\n")
+	end
+
+	---------------- Abilities tab ----------------
+	local abilityOptions = {}
+	for _, id in ipairs(ABILITY_IDS) do
+		table.insert(abilityOptions, abilityLabel(id))
+	end
+
+	local AbilCard = abilitiesTab:Card({ Title = "Auto Abilities", Side = "Left" })
+	AbilCard:Toggle({
+		Name = "Use Abilities When Ready",
+		Flag = "AbilityAsap",
+		Keybind = true,
+		Tooltip = "Uses each unlocked ability the moment its cooldown ends. "
+			.. "Abilities in a group that's switched on are left to that group.",
+		Callback = function(v)
+			Abil.Asap = v
+		end,
+	})
+	AbilCard:Toggle({
+		Name = "Use Ability Groups",
+		Flag = "AbilityGroupsOn",
+		Keybind = true,
+		Tooltip = "Runs the groups below: each one waits until all of its abilities are ready, then uses them in order.",
+		Callback = function(v)
+			Abil.GroupsOn = v
+		end,
+	})
+	AbilCard:Toggle({
+		Name = "Reuse Quick Abilities While Waiting",
+		Default = true,
+		Flag = "AbilityEarlyUse",
+		Tooltip = "While a group waits on its slowest ability, its faster ones are used in the meantime, "
+			.. "but only when they'll be ready again before the group fires. Decoy and Hamburger are never used early.",
+		Callback = function(v)
+			Abil.EarlyUse = v
+		end,
+	})
+	AbilCard:Toggle({
+		Name = "Only While Auto Attack Is Attacking",
+		Flag = "AbilityOnlyAttacking",
+		Tooltip = "Holds abilities until Auto Attack is hitting your chicken, so boosts like Super Saiyan aren't wasted.",
+		Callback = function(v)
+			Abil.OnlyAttacking = v
+		end,
+	})
+	AbilCard:Dropdown({
+		Name = "Never Use When Ready",
+		Multi = true,
+		Options = abilityOptions,
+		Placeholder = "None",
+		Flag = "AbilityNever",
+		Tooltip = "Skipped by Use Abilities When Ready (groups can still use them). "
+			.. "Handy for Decoy and Hamburger, which work best right before / after a specific ability.",
+		Callback = function(labels)
+			local set = {}
+			for _, label in ipairs(labels or {}) do
+				local id = idFromLabel(label)
+				if id then
+					set[tostring(id)] = true
+				end
+			end
+			Abil.Never = set
+		end,
+	})
+	AbilCard:Slider({
+		Name = "Delay Between Abilities",
+		Min = 0.2,
+		Max = 3,
+		Increment = 0.1,
+		Default = 0.5,
+		Suffix = "s",
+		Flag = "AbilityGap",
+		Callback = function(v)
+			Abil.Gap = v
+		end,
+	})
+
+	-- Group settings live in a pop-up window (Ember's Dialog) so the tab stays tidy.
+	-- An older ember.lua without Dialog gets the group cards on the tab instead.
+	local window = abilitiesTab.Window
+	local groupDialog
+	if type(window) == "table" and type(window.Dialog) == "function" then
+		groupDialog = window:Dialog({ Title = "Ability Groups", Width = 640, Height = 420 })
+	end
+	local groupHost = groupDialog or abilitiesTab
+	local groupSummary
+	if groupDialog then
+		local GroupsCard = abilitiesTab:Card({ Title = "Groups", Side = "Left" })
+		groupSummary = GroupsCard:Paragraph({ Content = "-" })
+		GroupsCard:Button({
+			Name = "Edit Groups",
+			Callback = function()
+				groupDialog:Open()
+			end,
+		})
+	end
+
+	local AbilLive = abilitiesTab:Card({ Title = "Live", Side = "Right" })
+	local abilityPara = AbilLive:Paragraph({ Content = "-" })
+
+	-- Group cards: one dropdown per step. Each ability can only be picked once across
+	-- every group, so picking it anywhere removes it from all the other lists.
+	local stepDropdowns = {} -- [g][k] = dropdown
+	local groupParas = {}
+	local refreshing = false
+
+	local function refreshStepOptions()
+		if refreshing then
+			return
+		end
+		refreshing = true
+		local used = {}
+		for g = 1, GROUP_COUNT do
+			for k = 1, STEPS_PER_GROUP do
+				local id = Groups[g].steps[k]
+				if id then
+					used[id] = true
+				end
+			end
+		end
+		for g = 1, GROUP_COUNT do
+			for k = 1, STEPS_PER_GROUP do
+				local own = Groups[g].steps[k]
+				local options = { "None" }
+				for _, id in ipairs(ABILITY_IDS) do
+					if not used[id] or id == own then
+						table.insert(options, abilityLabel(id))
+					end
+				end
+				local dropdown = stepDropdowns[g] and stepDropdowns[g][k]
+				if dropdown then
+					pcall(dropdown.Refresh, dropdown, options, true)
+				end
+			end
+		end
+		refreshing = false
+	end
+
+	local ORDINALS = { "1st", "2nd", "3rd", "4th", "5th" }
+	for g = 1, GROUP_COUNT do
+		local card = groupHost:Card({ Title = "Group " .. g, Side = g % 2 == 1 and "Left" or "Right" })
+		card:Toggle({
+			Name = "Use Group " .. g,
+			Flag = "AbilityGroup" .. g,
+			Callback = function(v)
+				Groups[g].enabled = v
+			end,
+		})
+		stepDropdowns[g] = {}
+		for k = 1, STEPS_PER_GROUP do
+			stepDropdowns[g][k] = card:Dropdown({
+				Name = ORDINALS[k],
+				Options = { "None", table.unpack(abilityOptions) },
+				Default = "None",
+				Flag = ("AbilityGroup%d_%d"):format(g, k),
+				Callback = function(label)
+					local id = idFromLabel(label)
+					id = id and tostring(id) or nil
+					-- an ability already used in another step can't be picked twice
+					if id then
+						for g2 = 1, GROUP_COUNT do
+							for k2 = 1, STEPS_PER_GROUP do
+								if (g2 ~= g or k2 ~= k) and Groups[g2].steps[k2] == id then
+									id = nil
+								end
+							end
+						end
+					end
+					Groups[g].steps[k] = id
+					if not id and label ~= "None" and stepDropdowns[g] and stepDropdowns[g][k] then
+						pcall(stepDropdowns[g][k].Set, stepDropdowns[g][k], "None", true)
+					end
+					refreshStepOptions()
+				end,
+			})
+		end
+		groupParas[g] = card:Paragraph({ Content = "-" })
+	end
+	refreshStepOptions()
+
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				abilityPara:Set(abilityText())
+				local summary = {}
+				for g = 1, GROUP_COUNT do
+					local names = {}
+					for _, id in ipairs(groupSteps(g)) do
+						table.insert(names, esc(abilityName(id)))
+					end
+					local order = #names > 0 and table.concat(names, " → ") or "empty"
+					groupParas[g]:Set(bold("Order: ") .. order .. "\n" .. bold("Status: ") .. esc(Groups[g].status))
+					if #names > 0 then
+						local on = Abil.GroupsOn and Groups[g].enabled
+						table.insert(summary, bold("Group " .. g .. ": ") .. order .. "\n"
+							.. (on and esc(Groups[g].status) or color("off", GREY)))
+					end
+				end
+				if groupSummary then
+					groupSummary:Set(#summary > 0 and table.concat(summary, "\n\n")
+						or color("No groups set up yet.", GREY))
+				end
+			end)
+			task.wait(1)
+		end
+	end)
+
+	------------------------------------------------------------------
+	-- Live card
+	------------------------------------------------------------------
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				livePara:Set(tradeText())
+			end)
+			pcall(function()
+				sellPara:Set(sellText())
+				boxPara:Set(boxText())
+			end)
+			task.wait(1)
+		end
+	end)
+
+	-- Lets the main script pause farming while a trade is going on
+	return {
+		busy = function()
+			if waitingToAccept then
+				return true, "master waiting to accept"
+			end
+			if TradeInfo.partner ~= nil then
+				return true, ("%s with %s"):format(string.lower(TradeInfo.phase), tostring(TradeInfo.partner))
+			end
+			return false
+		end,
+	}
 end
-if not hasTouch then
-	table.insert(lines, "Your executor doesn't support firetouchinterest, so meat and grapes won't collect.")
-end
-if heroDataError then
-	table.insert(lines, "Couldn't read HeroesData, so hero names and upgrade counts are missing.")
-end
-if not tradingOk then
-	table.insert(lines, "The Items, Abilities and Alt / Master tabs didn't load (open one to see why).")
-end
-table.insert(lines, "Press " .. tostring(Ember.Flags.Ember_MenuKey or "K") .. " to hide or show the menu.")
-Ember:Notify({ Title = "Egg Farm loaded", Content = table.concat(lines, "\n"), Duration = 6 })
