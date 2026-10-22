@@ -182,28 +182,47 @@ local bossActive = false -- boss farm owns the character (pauses diamonds)
 -- trade isn't disturbed. A boss fight is more important, so it never pauses and
 -- the trading code doesn't start a trade during one.
 local tradingApi -- set once the Items / Alt / Master file loads
+local GUI_PAUSE_LIMIT = 120 -- stop trusting a trade window that's been up this long with no trade of ours
+local guiPauseSince
+
+-- Returns true plus a short reason while farming should pause for a trade
 local function tradePaused()
 	if bossActive then
+		guiPauseSince = nil
 		return false
 	end
+	-- our own trade code: the alt sending, or the master receiving
+	if tradingApi and type(tradingApi.busy) == "function" then
+		local ok, busy, why = pcall(tradingApi.busy)
+		if ok and busy == true then
+			guiPauseSince = nil
+			return true, why or "trading"
+		end
+	end
+	-- a trade window or trade request on screen (also covers trades you do by hand)
+	local reason
 	local gui = player:FindFirstChild("PlayerGui")
 	local menus = gui and gui:FindFirstChild("Menus")
 	local trade = menus and menus:FindFirstChild("Trade")
 	if trade and trade.Visible then
-		return true
-	end
-	-- the game's trade prompt moves between Menus.Trade and Menus
-	for _, parent in ipairs({ trade, menus }) do
-		local prompt = parent and parent:FindFirstChild("Prompt")
-		if prompt and prompt.Visible then
-			return true
+		reason = "trade window open"
+	else
+		-- the game moves its trade prompt out of Menus.Trade into Menus while it's showing
+		local prompt = menus and menus:FindFirstChild("Prompt")
+		local title = prompt and prompt:FindFirstChild("Title")
+		if prompt and prompt.Visible and title and tostring(title.Text):find("Trade") then
+			reason = "trade request showing"
 		end
 	end
-	if tradingApi and type(tradingApi.busy) == "function" then
-		local ok, busy = pcall(tradingApi.busy)
-		return ok and busy == true
+	if not reason then
+		guiPauseSince = nil
+		return false
 	end
-	return false
+	guiPauseSince = guiPauseSince or os.clock()
+	if os.clock() - guiPauseSince > GUI_PAUSE_LIMIT then
+		return false -- something left the window up; don't stay paused forever
+	end
+	return true, reason
 end
 
 local function log(...)
@@ -1200,8 +1219,9 @@ local function farmText()
 		table.insert(lines, bold("Farm: ") .. color("Not found", RED) .. " — use Re-find My Farm")
 	end
 	table.insert(lines, bold("Grape transmitters: ") .. grapeTransmitters)
-	if tradePaused() then
-		table.insert(lines, color("Paused while a trade is going on", YELLOW))
+	local paused, why = tradePaused()
+	if paused then
+		table.insert(lines, color("Paused for trade: " .. esc(why or "?"), YELLOW))
 	end
 	if not hasTouch then
 		table.insert(lines, color("firetouchinterest isn't supported by this executor", RED))
@@ -1278,6 +1298,20 @@ local function trophyText()
 		bold("Owned: ") .. #trophies .. "   " .. bold("To reroll: ") .. unsaved,
 		bold("Saved owned: ") .. savedCount .. (#names > 0 and "\n" .. table.concat(names, ", ") or ""),
 		bold("Rerolls sent: ") .. Stats.Rerolls,
+	}, "\n")
+end
+
+-- workspace.DistributedGameTime is replicated from the server: seconds since the server started
+local function serverText()
+	local seconds = math.max(0, math.floor(workspace.DistributedGameTime))
+	local d, h = math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600)
+	local m, s = math.floor(seconds % 3600 / 60), seconds % 60
+	local age = d > 0 and ("%dd %dh %02dm"):format(d, h, m) or ("%dh %02dm %02ds"):format(h, m, s)
+	local started = os.date("%I:%M %p", os.time() - seconds):gsub("^0", "")
+	return table.concat({
+		bold("Server age: ") .. age,
+		bold("Started at: ") .. started .. " (your time)",
+		bold("Players: ") .. #Players:GetPlayers() .. " / " .. Players.MaxPlayers,
 	}, "\n")
 end
 
@@ -1665,6 +1699,7 @@ local statusBoss = StatusTab:Card({ Title = "Boss", Side = "Left" }):Paragraph({
 local statusHeroes = StatusTab:Card({ Title = "Heroes", Side = "Right" }):Paragraph({ Content = "-" })
 local statusTrophies = StatusTab:Card({ Title = "Trophies", Side = "Right" }):Paragraph({ Content = "-" })
 local statusSession = StatusTab:Card({ Title = "Session", Side = "Right" }):Paragraph({ Content = "-" })
+local statusServer = StatusTab:Card({ Title = "Server", Side = "Left" }):Paragraph({ Content = "-" })
 
 ---------------- Settings ----------------
 Ember:BuildSettings(SettingsTab)
@@ -1706,6 +1741,7 @@ task.spawn(function()
 			statusHeroes:Set(heroes)
 			statusTrophies:Set(trophies)
 			statusSession:Set(sessionStats)
+			statusServer:Set(serverText())
 
 			live.diamonds:Set(table.concat({
 				bold("Waiting: ") .. countDiamonds(getDiamondFolder()),
