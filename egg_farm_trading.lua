@@ -1,7 +1,11 @@
 --[[
-	Egg Farm Simulator · Alt / Master trading
+	Egg Farm Simulator · Items tab (auto sell / auto open boxes) + Alt / Master trading
 	Loaded by the main autofarm script from GitHub (kept separate so the main
 	script stays small enough to paste into an executor). Not meant to be run on its own.
+
+	Selling and box opening live here with trading so they can coordinate: a box
+	reveal hides every menu (which cancels a trade), so boxes never open during a
+	trade and trades wait for a box to finish.
 
 	Alts trade their items to the master account. Each account's role is saved per
 	UserId in workspace/EggFarmSim/accounts.json, so several accounts on one PC each
@@ -12,6 +16,10 @@
 return function(ctx)
 	local tab = ctx.Tab
 	local alive, track, log, notify = ctx.alive, ctx.track, ctx.log, ctx.notify
+	-- true while this account is fighting the boss: no trade starts during a fight
+	local bossBusy = type(ctx.bossBusy) == "function" and ctx.bossBusy or function()
+		return false
+	end
 	local idFromLabel, heroOptions = ctx.idFromLabel, ctx.heroOptions
 
 	local Players = game:GetService("Players")
@@ -19,8 +27,10 @@ return function(ctx)
 	local HttpService = game:GetService("HttpService")
 	local player = Players.LocalPlayer
 
+	local itemsTab = ctx.ItemsTab
 	local Events = ReplicatedStorage:FindFirstChild("Events")
 	local TradeEvent = Events and Events:WaitForChild("Trade", 5)
+	local ItemsEvent = Events and Events:FindFirstChild("Items")
 	if not TradeEvent then
 		error("ReplicatedStorage.Events.Trade wasn't found", 0)
 	end
@@ -35,6 +45,15 @@ return function(ctx)
 	local function bold(text)
 		return "<b>" .. text .. "</b>"
 	end
+
+	-- Opening a box plays a reveal that hides every menu, which cancels an open trade.
+	-- The box opener sets this while a box is opening; trades wait for it, and the
+	-- box opener waits for trades (see tradeActive below).
+	local boxBusyUntil = 0
+	local function boxBusy()
+		return os.clock() < boxBusyUntil
+	end
+	local waitingToAccept = false -- master is holding a request until a box finishes
 
 	-- Requires a game module, but gives up after `timeout` so it can never freeze loading
 	local function requireWithin(folderName, moduleName, timeout)
@@ -61,8 +80,8 @@ return function(ctx)
 		BoxData = nil
 	end
 
-	-- Your live player data (same source the game's inventory and trade menus use).
-	-- Only loaded the first time an alt builds a trade, so Off / Master never touch it.
+	-- Your live inventory (the same data the game's inventory menu reads).
+	-- Only loaded the first time something is sold, so it can't slow down startup.
 	local dataJob
 	local function getData()
 		if not dataJob then
@@ -83,13 +102,17 @@ return function(ctx)
 				end
 				dataJob.done = true
 			end)
+			local start = os.clock()
+			while not dataJob.done and os.clock() - start < 5 do
+				task.wait()
+			end
 		end
 		if not dataJob.value then
-			return nil, dataJob.done and ("Couldn't read your inventory: " .. tostring(dataJob.err)) or "Loading your inventory data..."
+			return nil, dataJob.done and ("Couldn't read your inventory: " .. tostring(dataJob.err)) or "Still loading your inventory..."
 		end
 		local ok, data = pcall(dataJob.value.Get, "data")
-		if not ok or type(data) ~= "table" then
-			return nil, "Couldn't read your inventory (DataHandler returned nothing)"
+		if not ok or type(data) ~= "table" or type(data.inventory) ~= "table" then
+			return nil, "Couldn't read your inventory"
 		end
 		return data
 	end
@@ -459,8 +482,24 @@ return function(ctx)
 			log("Ignoring trade request from", from)
 			return
 		end
+		-- let a box that's opening finish first, or its reveal would close the trade
+		waitingToAccept = true
+		local start = os.clock()
+		while alive() and boxBusy() and os.clock() - start < 15 do
+			task.wait(0.1)
+		end
 		task.wait(0.3) -- let the game finish showing its "Trade Requested" prompt
+		waitingToAccept = false
 		if not alive() or isTradeOpen() then
+			return
+		end
+		-- the boss fight comes first: turn the request down, the alt tries again later
+		if bossBusy() then
+			pcall(function()
+				TradeEvent:FireServer("Decline", from)
+			end)
+			hidePrompt()
+			TradeInfo.message = ("Declined %s's request: fighting the boss"):format(from)
 			return
 		end
 
@@ -582,7 +621,15 @@ return function(ctx)
 			return 5
 		end
 
-		-- 1. request
+		-- 1. request (nothing below yields before the request is out, so a box can't start in between)
+		if bossBusy() then
+			TradeInfo.message = "Waiting for the boss fight to end"
+			return 3
+		end
+		if boxBusy() then
+			TradeInfo.message = "Waiting for a box to finish opening"
+			return 1
+		end
 		table.clear(pending)
 		resetTradeInfo("Requesting a trade with " .. master)
 		TradeInfo.partner, TradeInfo.phase, TradeInfo.startedAt = master, "Requesting", os.clock()
@@ -734,6 +781,314 @@ return function(ctx)
 		return set
 	end
 
+	-- True while a trade window, a trade request or one of our own trades is in progress
+	local function tradeActive()
+		local trade = getTradeFrame()
+		local menus = trade and trade.Parent
+		if trade and trade.Visible then
+			return true
+		end
+		-- the game's "Trade Requested" / "Trade Request Sent" prompt moves between Menus.Trade and Menus
+		for _, parent in ipairs({ trade, menus }) do
+			local prompt = parent and parent:FindFirstChild("Prompt")
+			if prompt and prompt.Visible then
+				return true
+			end
+		end
+		return TradeInfo.partner ~= nil or waitingToAccept
+	end
+
+	------------------------------------------------------------------
+	-- Auto Sell (weapons, wings and trails; trophies and boxes are never touched)
+	------------------------------------------------------------------
+	local SELL_TYPES = { "Weapons", "Wings", "Trails" }
+
+	local Sell = {
+		Enabled = false,
+		Types = { Weapons = true, Wings = true, Trails = true },
+		KeepTiers = {}, -- [tier] = true
+		Keep = { Weapons = {}, Wings = {}, Trails = {} }, -- [category][item name] = true
+		Delay = 0.15,
+		sold = 0,
+		diamonds = 0,
+		message = "-",
+	}
+
+	-- Rarity name for a tier ("Legendary"), from the game's BoxData
+	local function rarityName(tier)
+		return BoxData and type(BoxData.Rarity) == "table" and BoxData.Rarity[tier] or nil
+	end
+
+	-- Name and tier of an inventory entry. Weapons are keyed "Name#abilities".
+	local function itemInfo(cat, key, value)
+		local name = cat == "Weapons" and type(value) == "table" and tostring(value[1]) or tostring(key)
+		local folder = ItemsFolder and ItemsFolder:FindFirstChild(cat)
+		local item = folder and folder:FindFirstChild(name)
+		local tier = item and item:FindFirstChild("Tier")
+		return name, tier and tonumber(tier.Value) or nil
+	end
+
+	-- Everything that would be sold right now: { cat, key, name, tier, count }
+	local function getSellList()
+		local data, err = getData()
+		if not data then
+			return nil, err
+		end
+		local list = {}
+		for _, cat in ipairs(SELL_TYPES) do
+			local inv = data.inventory[string.lower(cat)]
+			local equipped = type(data.using) == "table" and data.using[string.lower(cat)] or nil
+			if Sell.Types[cat] and type(inv) == "table" then
+				for key, value in pairs(inv) do
+					local count
+					if cat == "Weapons" then
+						count = type(value) == "table" and (tonumber(value[3]) or 1) or 0
+					else
+						count = tonumber(value) or 0
+					end
+					local name, tier = itemInfo(cat, key, value)
+					local keptTier = next(Sell.KeepTiers) ~= nil and (tier == nil or Sell.KeepTiers[tier])
+					local isEquipped = equipped ~= nil and tostring(key) == tostring(equipped)
+					if count > 0 and not isEquipped and not keptTier and not Sell.Keep[cat][name] then
+						table.insert(list, { cat = cat, key = key, name = name, tier = tier, count = count })
+					end
+				end
+			end
+		end
+		return list
+	end
+
+	-- Diamonds the game pays for one item (30% of its tier's box price, same as its sell menu)
+	local function sellPrice(tier)
+		local price = BoxData and type(BoxData.Price) == "table" and tier and tonumber(BoxData.Price[tier])
+		return price and math.floor(price * 0.3) or 0
+	end
+
+	-- Sells everything on the list, one copy per call, re-reading the inventory
+	-- between rounds until nothing sellable is left
+	local selling = false
+	local function sellAll(force)
+		if selling then
+			return 0
+		end
+		selling = true
+		local total = 0
+		local ok, err = pcall(function()
+			local lastCount
+			for _ = 1, 50 do -- safety cap on rounds
+				local list, listErr = getSellList()
+				if not list then
+					Sell.message = listErr
+					return
+				end
+				if #list == 0 then
+					break
+				end
+				-- stop instead of spamming if the last round didn't remove anything
+				local count = 0
+				for _, entry in ipairs(list) do
+					count += entry.count
+				end
+				if lastCount and count >= lastCount then
+					Sell.message = "Your inventory didn't change after selling, so the game may be rejecting the sells"
+					return
+				end
+				lastCount = count
+				for _, entry in ipairs(list) do
+					for _ = 1, entry.count do
+						if tradeActive() then
+							Sell.message = "Paused: a trade is active"
+							return
+						end
+						if not (alive() and (force or Sell.Enabled)) then
+							return
+						end
+						ItemsEvent:FireServer("Sell", entry.cat, entry.key)
+						total += 1
+						Sell.sold += 1
+						Sell.diamonds += sellPrice(entry.tier)
+						log("Sold", entry.cat, entry.key)
+						task.wait(Sell.Delay)
+					end
+				end
+				task.wait(0.5) -- let the inventory update before checking again
+			end
+			Sell.message = total > 0 and ("Sold %d item(s)"):format(total) or "Nothing to sell"
+		end)
+		if not ok then
+			Sell.message = "Error: " .. tostring(err)
+			warn("[EggFarm] Sell error:", err)
+		end
+		selling = false
+		return total
+	end
+
+	task.spawn(function()
+		while alive() do
+			if Sell.Enabled and not tradeActive() then
+				sellAll(false)
+				task.wait(2)
+			end
+			task.wait(0.5)
+		end
+	end)
+
+	------------------------------------------------------------------
+	-- Auto Open Boxes
+	-- Opening a box plays the game's reveal animation, which hides every other
+	-- menu, including an open trade window (and hiding the trade window cancels
+	-- the trade). So boxes are only opened while no trade is active or being set
+	-- up, and the trading code waits for a box to finish before starting one.
+	------------------------------------------------------------------
+	local BoxesEvent = Events:FindFirstChild("Boxes")
+
+	local Boxes = {
+		Enabled = false,
+		Only = {}, -- [tier] = true; empty = every box
+		Delay = 0.5,
+		opened = 0,
+		message = "-",
+	}
+
+	local boxOpenedAt = 0
+	if BoxesEvent then
+		track(BoxesEvent.OnClientEvent:Connect(function(kind)
+			if kind == "Open" then
+				boxOpenedAt = os.clock()
+			end
+		end))
+	end
+
+	-- Inventory keys of every box we'd open, in order
+	local function getBoxesToOpen()
+		local data, err = getData()
+		if not data then
+			return nil, err
+		end
+		local inv = data.inventory.boxes
+		local list = {}
+		if type(inv) == "table" then
+			for key, tier in pairs(inv) do
+				if next(Boxes.Only) == nil or Boxes.Only[tonumber(tier)] then
+					table.insert(list, key)
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			return tostring(a) < tostring(b)
+		end)
+		return list
+	end
+
+	-- Opens one box and waits for the game to start its reveal. Returns false if the
+	-- box wasn't opened because a trade started, nil if the game never answered.
+	local function openOneBox(key)
+		if tradeActive() then
+			return false
+		end
+		-- no yield between the check above and this, so a trade can't sneak in between
+		boxBusyUntil = os.clock() + 6
+		local before = boxOpenedAt
+		ItemsEvent:FireServer("Use", "Boxes", tostring(key))
+		local start = os.clock()
+		while alive() and boxOpenedAt == before and os.clock() - start < 5 do
+			task.wait(0.05)
+		end
+		local opened = boxOpenedAt ~= before
+		-- keep trades waiting until the reveal has had time to finish
+		boxBusyUntil = os.clock() + Boxes.Delay + 1
+		task.wait(Boxes.Delay)
+		return opened or nil
+	end
+
+	local openingBoxes = false
+	local function openAllBoxes(force)
+		if openingBoxes then
+			return 0
+		end
+		openingBoxes = true
+		local total, misses = 0, 0
+		local ok, err = pcall(function()
+			while alive() and (force or Boxes.Enabled) do
+				local list, listErr = getBoxesToOpen()
+				if not list then
+					Boxes.message = listErr
+					return
+				end
+				if #list == 0 then
+					break
+				end
+				local result = openOneBox(list[1]) -- keys shift after each open, so always re-read
+				if result == false then
+					Boxes.message = "Paused: a trade is active"
+					return
+				elseif result == nil then
+					misses += 1
+					if misses >= 3 then
+						Boxes.message = "The game stopped answering box opens; trying again shortly"
+						return
+					end
+				else
+					misses = 0
+					total += 1
+					Boxes.opened += 1
+					log("Opened box", list[1])
+				end
+			end
+			Boxes.message = total > 0 and ("Opened %d box(es)"):format(total) or "No boxes to open"
+		end)
+		if not ok then
+			Boxes.message = "Error: " .. tostring(err)
+			warn("[EggFarm] Box error:", err)
+		end
+		openingBoxes = false
+		return total
+	end
+
+	task.spawn(function()
+		while alive() do
+			if Boxes.Enabled and not tradeActive() then
+				openAllBoxes(false)
+				task.wait(2)
+			end
+			task.wait(0.5)
+		end
+	end)
+
+	local function boxText()
+		local lines = { bold("Auto open: ") .. (Boxes.Enabled and color("ON", GREEN) or color("OFF", GREY))
+			.. (tradeActive() and "  " .. color("paused for trade", YELLOW) or "") }
+		if dataJob then
+			local list = getBoxesToOpen()
+			if list then
+				table.insert(lines, bold("Boxes to open: ") .. #list)
+			end
+		end
+		table.insert(lines, bold("Opened: ") .. Boxes.opened)
+		table.insert(lines, bold("Last: ") .. esc(Boxes.message))
+		return table.concat(lines, "\n")
+	end
+
+	local function sellText()
+		local lines = { bold("Auto sell: ") .. (Sell.Enabled and color("ON", GREEN) or color("OFF", GREY)) }
+		if dataJob then
+			local list = getSellList()
+			if list then
+				local items, worth = 0, 0
+				for _, entry in ipairs(list) do
+					items += entry.count
+					worth += sellPrice(entry.tier) * entry.count
+				end
+				table.insert(lines, bold("Sellable now: ") .. items .. (worth > 0 and ("  (~%d 💎)"):format(worth) or ""))
+			end
+		else
+			table.insert(lines, bold("Sellable now: ") .. color("press Sell Now or turn on Auto Sell", GREY))
+		end
+		table.insert(lines, bold("Sold: ") .. Sell.sold .. (Sell.diamonds > 0 and ("  (~%d 💎)"):format(Sell.diamonds) or ""))
+		table.insert(lines, bold("Last: ") .. esc(Sell.message))
+		return table.concat(lines, "\n")
+	end
+
 	---------------- live text ----------------
 	local function tradeText()
 		local lines = { bold("Role: ") .. currentRole }
@@ -766,6 +1121,167 @@ return function(ctx)
 	------------------------------------------------------------------
 	-- Menu
 	------------------------------------------------------------------
+	---------------- Items tab ----------------
+	-- "[5] Legendary" labels for every rarity the game has
+	local rarityOptions = {}
+	if BoxData and type(BoxData.Rarity) == "table" then
+		local tiers = {}
+		for tier in pairs(BoxData.Rarity) do
+			if tonumber(tier) then
+				table.insert(tiers, tonumber(tier))
+			end
+		end
+		table.sort(tiers)
+		for _, tier in ipairs(tiers) do
+			table.insert(rarityOptions, ("[%d] %s"):format(tier, tostring(rarityName(tier))))
+		end
+	end
+
+	local SellCard = itemsTab:Card({ Title = "Auto Sell", Side = "Left" })
+	SellCard:Toggle({
+		Name = "Auto Sell Items",
+		Flag = "AutoSell",
+		Keybind = true,
+		Tooltip = "Keeps selling every weapon, wing and trail you get, except the ones kept on the right. "
+			.. "Trophies, boxes and anything equipped are never sold. If this account is an alt sending items to "
+			.. "the master, anything sold here can't be traded.",
+		Callback = function(v)
+			Sell.Enabled = v
+		end,
+	})
+	SellCard:Dropdown({
+		Name = "Item Types to Sell",
+		Multi = true,
+		Options = SELL_TYPES,
+		Default = SELL_TYPES,
+		Placeholder = "Nothing",
+		Flag = "SellTypes",
+		Callback = function(list)
+			local set = {}
+			for _, cat in ipairs(list or {}) do
+				set[cat] = true
+			end
+			Sell.Types = set
+		end,
+	})
+	SellCard:Slider({
+		Name = "Delay Between Sells",
+		Min = 0.05,
+		Max = 1,
+		Increment = 0.05,
+		Default = 0.15,
+		Suffix = "s",
+		Flag = "SellDelay",
+		Callback = function(v)
+			Sell.Delay = v
+		end,
+	})
+	SellCard:Button({
+		Name = "Sell Now",
+		Callback = function()
+			task.spawn(function()
+				notify("Sell", ("Sold %d item(s)."):format(sellAll(true)))
+			end)
+		end,
+	})
+
+	local BoxCard = itemsTab:Card({ Title = "Auto Open Boxes", Side = "Left" })
+	BoxCard:Toggle({
+		Name = "Auto Open Boxes",
+		Flag = "AutoOpenBoxes",
+		Keybind = true,
+		Tooltip = "Opens your boxes one at a time. Pauses whenever a trade window or trade request is up, "
+			.. "because the box animation would close the trade. If this account is an alt sending boxes "
+			.. "to the master, opened boxes can't be traded.",
+		Callback = function(v)
+			Boxes.Enabled = v
+		end,
+	})
+	BoxCard:Dropdown({
+		Name = "Only Open These Boxes",
+		Multi = true,
+		Options = boxOptions(),
+		Placeholder = "All",
+		Flag = "OpenBoxTiers",
+		Callback = function(labels)
+			local set = {}
+			for _, label in ipairs(labels or {}) do
+				local tier = idFromLabel(label)
+				if tier then
+					set[tier] = true
+				end
+			end
+			Boxes.Only = set
+		end,
+	})
+	BoxCard:Slider({
+		Name = "Delay Between Boxes",
+		Min = 0,
+		Max = 5,
+		Increment = 0.25,
+		Default = 0.5,
+		Suffix = "s",
+		Flag = "OpenBoxDelay",
+		Tooltip = "Extra wait after each box so the reveal animation can finish.",
+		Callback = function(v)
+			Boxes.Delay = v
+		end,
+	})
+	BoxCard:Button({
+		Name = "Open All Now",
+		Callback = function()
+			task.spawn(function()
+				if tradeActive() then
+					notify("Boxes", "Finish or cancel the trade first.")
+					return
+				end
+				notify("Boxes", ("Opened %d box(es)."):format(openAllBoxes(true)))
+			end)
+		end,
+	})
+
+	local KeepCard = itemsTab:Card({ Title = "Never Sell", Side = "Right" })
+	KeepCard:Dropdown({
+		Name = "Keep These Rarities",
+		Multi = true,
+		Options = rarityOptions,
+		Placeholder = "None",
+		Flag = "SellKeepTiers",
+		Tooltip = "Items of these rarities are never sold.",
+		Callback = function(labels)
+			local set = {}
+			for _, label in ipairs(labels or {}) do
+				local tier = idFromLabel(label)
+				if tier then
+					set[tier] = true
+				end
+			end
+			Sell.KeepTiers = set
+		end,
+	})
+	for _, cat in ipairs(SELL_TYPES) do
+		KeepCard:Dropdown({
+			Name = "Keep These " .. cat,
+			Multi = true,
+			Search = true,
+			Options = itemOptions(cat),
+			Placeholder = "None",
+			Flag = "SellKeep" .. cat,
+			Callback = function(names)
+				local set = {}
+				for _, name in ipairs(names or {}) do
+					set[name] = true
+				end
+				Sell.Keep[cat] = set
+			end,
+		})
+	end
+
+	local SellLive = itemsTab:Card({ Title = "Live", Side = "Right" })
+	local sellPara = SellLive:Paragraph({ Content = "-" })
+	local boxPara = SellLive:Paragraph({ Content = "-" })
+
+	---------------- Alt / Master tab ----------------
 	---------------- Alt / Master ----------------
 	local AccountCard = tab:Card({ Title = "Account", Side = "Left" })
 	local AltCard = tab:Card({ Title = "Send to Master", Side = "Left" })
@@ -921,7 +1437,18 @@ return function(ctx)
 			pcall(function()
 				livePara:Set(tradeText())
 			end)
+			pcall(function()
+				sellPara:Set(sellText())
+				boxPara:Set(boxText())
+			end)
 			task.wait(1)
 		end
 	end)
+
+	-- Lets the main script pause farming while a trade is going on
+	return {
+		busy = function()
+			return TradeInfo.partner ~= nil or waitingToAccept
+		end,
+	}
 end
