@@ -645,7 +645,7 @@ function Library:CreateWindow(opts)
 	})
 	list(controls, 6, true, Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Center)
 
-	local function controlButton(glyph, order, danger)
+	local function controlButton(glyph, order, danger, parent)
 		local b = create("TextButton", {
 			AutoButtonColor = false,
 			BackgroundColor3 = Theme.Panel,
@@ -657,7 +657,7 @@ function Library:CreateWindow(opts)
 			TextTransparency = 0.4,
 			Text = glyph,
 			LayoutOrder = order,
-			Parent = controls,
+			Parent = parent or controls,
 		})
 		round(b, 5)
 		local st = outline(b, Theme.Stroke, 1.25, 0.5)
@@ -1092,6 +1092,187 @@ function Library:CreateWindow(opts)
 		pageTitle.Text = tab.Name
 		tab._holder.Position = UDim2.fromOffset(0, 10)
 		tween(tab._holder, { Position = UDim2.new() }, 0.25)
+	end
+
+	---------------------------------------------------------------- dialogs
+	-- A pop-up window over the menu with its own title bar and close button.
+	-- It works like a tab: dialog:Card({...}) takes the same cards and elements.
+	function Window:Dialog(dopts)
+		if type(dopts) == "string" then
+			dopts = { Title = dopts }
+		end
+		dopts = dopts or {}
+		local Dialog = setmetatable({
+			Window = Window,
+			Name = dopts.Title or "Dialog",
+			Visible = false,
+			_sides = { Left = 0, Right = 0 },
+		}, TabMeta)
+
+		local layer = create("Frame", {
+			Name = "Dialog",
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			ZIndex = 20,
+			Visible = false,
+			Parent = root,
+		})
+		local shade = create("TextButton", {
+			Name = "Shade",
+			AutoButtonColor = false,
+			Text = "",
+			BackgroundColor3 = BLACK,
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			Parent = layer,
+		})
+		round(shade, 8)
+
+		local w = math.min(dopts.Width or contentW, root.Size.X.Offset - 32)
+		local h = math.min(dopts.Height or (height - 60), height - 32)
+		local box = panel(layer, "Window", UDim2.fromOffset(w, h))
+		box.AnchorPoint = Vector2.new(0.5, 0.5)
+		box.Position = UDim2.fromScale(0.5, 0.5)
+		box.ZIndex = 2
+		create("ImageLabel", {
+			Name = "Shadow",
+			BackgroundTransparency = 1,
+			Image = "rbxassetid://6014261993",
+			ImageColor3 = BLACK,
+			ImageTransparency = 0.4,
+			ScaleType = Enum.ScaleType.Slice,
+			SliceCenter = Rect.new(49, 49, 450, 450),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.new(1, 46, 1, 46),
+			ZIndex = 0,
+			Parent = box,
+		})
+
+		local bar = create("Frame", { Name = "Topbar", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 42), Parent = box })
+		local titleLbl = text({
+			Name = "Title",
+			Text = Dialog.Name,
+			Font = Theme.FontBold,
+			TextSize = 15,
+			Position = UDim2.fromOffset(16, 0),
+			Size = UDim2.new(1, -60, 1, 0),
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = bar,
+		})
+		local barControls = create("Frame", {
+			Name = "Controls",
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -12, 0.5, 0),
+			Size = UDim2.fromOffset(0, 22),
+			AutomaticSize = Enum.AutomaticSize.X,
+			Parent = bar,
+		})
+		list(barControls, 6, true, Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Center)
+		local closeDialog = controlButton("×", 1, true, barControls)
+		local line = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = UDim2.new(0.5, 0, 0, 42),
+			Size = UDim2.new(1, -24, 0, 1),
+			BackgroundColor3 = Theme.Divider,
+			BackgroundTransparency = 0.4,
+			Parent = box,
+		})
+		fade(line, { { 0, 1 }, { 0.1, 0.3 }, { 0.5, 0 }, { 0.9, 0.3 }, { 1, 1 } }, 0)
+
+		local page = create("ScrollingFrame", {
+			Name = "Page",
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(0, 43),
+			Size = UDim2.new(1, 0, 1, -46),
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			ScrollBarThickness = 2,
+			ScrollBarImageTransparency = 0.7,
+			Parent = box,
+		})
+		paint(page, "ScrollBarImageColor3", "Accent")
+		pad(page, 10, 10, 10, 10)
+		local holder = create("Frame", {
+			Name = "Columns",
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Parent = page,
+		})
+		list(holder, 8, true)
+		local single = dopts.Columns == 1
+		local function column(name, ord)
+			local c = create("Frame", {
+				Name = name,
+				BackgroundTransparency = 1,
+				Size = single and UDim2.new(1, 0, 0, 0) or UDim2.new(0.5, -4, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				LayoutOrder = ord,
+				Parent = holder,
+			})
+			list(c, 8)
+			return c
+		end
+		Dialog.Left = column("Left", 1)
+		Dialog.Right = single and Dialog.Left or column("Right", 2)
+		Dialog._page = page
+		Dialog._holder = holder
+		Dialog.Frame = box
+		bind(page:GetPropertyChangedSignal("CanvasPosition"), function()
+			Window:_closePopup()
+		end)
+
+		function Dialog:Open()
+			if self.Visible then
+				return
+			end
+			self.Visible = true
+			Window:_closePopup()
+			layer.Visible = true
+			shade.BackgroundTransparency = 1
+			box.Position = UDim2.new(0.5, 0, 0.5, 14)
+			tween(shade, { BackgroundTransparency = 0.45 }, 0.2)
+			tween(box, { Position = UDim2.fromScale(0.5, 0.5) }, 0.25, Enum.EasingStyle.Back)
+			fire(dopts.OnOpen)
+		end
+		function Dialog:Close()
+			if not self.Visible then
+				return
+			end
+			self.Visible = false
+			Window:_closePopup()
+			tween(shade, { BackgroundTransparency = 1 }, 0.12)
+			local tw = tween(box, { Position = UDim2.new(0.5, 0, 0.5, 14) }, 0.12, Enum.EasingStyle.Quad)
+			tw.Completed:Connect(function()
+				if not self.Visible then
+					layer.Visible = false
+				end
+			end)
+			fire(dopts.OnClose)
+		end
+		function Dialog:Toggle()
+			if self.Visible then
+				self:Close()
+			else
+				self:Open()
+			end
+		end
+		function Dialog:SetTitle(t)
+			titleLbl.Text = t
+		end
+
+		closeDialog.MouseButton1Click:Connect(function()
+			Dialog:Close()
+		end)
+		if dopts.CloseOnShade ~= false then
+			shade.MouseButton1Click:Connect(function()
+				Dialog:Close()
+			end)
+		end
+		return Dialog
 	end
 
 	gui.Parent = guiParent()
@@ -2400,6 +2581,9 @@ Window:Section(name)                         sidebar header
 Window:Tab({ Name, Icon?, Columns? }) -> Tab Columns = 1 for a single full-width column
 Window:SelectTab(tab | name)
 Window:SetVisible(bool) / Window:Toggle()
+Window:Dialog({ Title, Width?, Height?, Columns?, CloseOnShade?, OnOpen?, OnClose? }) -> Dialog
+	a pop-up window over the menu; Dialog:Card({...}) works like Tab:Card
+	Dialog:Open() / Dialog:Close() / Dialog:Toggle() / Dialog:SetTitle(text) / Dialog.Visible
 Window:Destroy()
 
 Tab:Card({ Title, Side?, Collapsible?, Collapsed? }) -> Card
