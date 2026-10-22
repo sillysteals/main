@@ -1769,6 +1769,26 @@ return function(ctx)
 		end,
 	})
 
+	-- Group settings live in a pop-up window (Ember's Dialog) so the tab stays tidy.
+	-- An older ember.lua without Dialog gets the group cards on the tab instead.
+	local window = abilitiesTab.Window
+	local groupDialog
+	if type(window) == "table" and type(window.Dialog) == "function" then
+		groupDialog = window:Dialog({ Title = "Ability Groups", Width = 640, Height = 420 })
+	end
+	local groupHost = groupDialog or abilitiesTab
+	local groupSummary
+	if groupDialog then
+		local GroupsCard = abilitiesTab:Card({ Title = "Groups", Side = "Left" })
+		groupSummary = GroupsCard:Paragraph({ Content = "-" })
+		GroupsCard:Button({
+			Name = "Edit Groups",
+			Callback = function()
+				groupDialog:Open()
+			end,
+		})
+	end
+
 	local AbilLive = abilitiesTab:Card({ Title = "Live", Side = "Right" })
 	local abilityPara = AbilLive:Paragraph({ Content = "-" })
 
@@ -1812,7 +1832,7 @@ return function(ctx)
 
 	local ORDINALS = { "1st", "2nd", "3rd", "4th", "5th" }
 	for g = 1, GROUP_COUNT do
-		local card = abilitiesTab:Card({ Title = "Group " .. g, Side = g % 2 == 1 and "Left" or "Right" })
+		local card = groupHost:Card({ Title = "Group " .. g, Side = g % 2 == 1 and "Left" or "Right" })
 		card:Toggle({
 			Name = "Use Group " .. g,
 			Flag = "AbilityGroup" .. g,
@@ -1856,13 +1876,23 @@ return function(ctx)
 		while alive() do
 			pcall(function()
 				abilityPara:Set(abilityText())
+				local summary = {}
 				for g = 1, GROUP_COUNT do
 					local names = {}
 					for _, id in ipairs(groupSteps(g)) do
 						table.insert(names, esc(abilityName(id)))
 					end
-					groupParas[g]:Set(bold("Order: ") .. (#names > 0 and table.concat(names, " → ") or "empty")
-						.. "\n" .. bold("Status: ") .. esc(Groups[g].status))
+					local order = #names > 0 and table.concat(names, " → ") or "empty"
+					groupParas[g]:Set(bold("Order: ") .. order .. "\n" .. bold("Status: ") .. esc(Groups[g].status))
+					if #names > 0 then
+						local on = Abil.GroupsOn and Groups[g].enabled
+						table.insert(summary, bold("Group " .. g .. ": ") .. order .. "\n"
+							.. (on and esc(Groups[g].status) or color("off", GREY)))
+					end
+				end
+				if groupSummary then
+					groupSummary:Set(#summary > 0 and table.concat(summary, "\n\n")
+						or color("No groups set up yet.", GREY))
 				end
 			end)
 			task.wait(1)
