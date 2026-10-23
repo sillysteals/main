@@ -34,9 +34,6 @@ local ItemsEvent = Events:WaitForChild("Items")
 local Heroes = {} -- [id] = { name = "Tarzan", upgrades = 5 }
 local heroDataError
 
-workspace.Farms:GetChildren()[3].Hatch.Egg.CanCollide = false
-workspace.Farms:GetChildren()[3].Hatch.Nest.CanCollide = false
-
 do
 	local ok, result = pcall(function()
 		return require(ReplicatedStorage:WaitForChild("Settings"):WaitForChild("HeroesData"))
@@ -350,6 +347,33 @@ local function getFarm(forceRefresh)
 	end
 	return cachedFarm
 end
+
+------------------------------------------------------------------
+-- Hatch: walk-through. Turns CanCollide off for every part in your farm's
+-- Hatch as soon as the farm is found, and keeps it off for parts added later.
+------------------------------------------------------------------
+task.spawn(function()
+	local hooked
+	while alive() do
+		local farm = getFarm()
+		local hatch = farm and farm:FindFirstChild("Hatch")
+		if hatch and hatch ~= hooked then
+			hooked = hatch
+			local function noCollide(obj)
+				if obj:IsA("BasePart") then
+					obj.CanCollide = false
+				end
+			end
+			noCollide(hatch)
+			for _, d in ipairs(hatch:GetDescendants()) do
+				noCollide(d)
+			end
+			track(hatch.DescendantAdded:Connect(noCollide))
+			log("Hatch collisions off:", hatch:GetFullName())
+		end
+		task.wait(hooked and hooked.Parent and 5 or 1)
+	end
+end)
 
 ------------------------------------------------------------------
 -- Auto Attack (your own farm's chicken)
